@@ -44,6 +44,7 @@
  * nothing else in the engine has ever done that. */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <string.h>
@@ -1482,6 +1483,406 @@ static int on(void)
 	return n > 0 && n < sizeof(v) && v[0] == '1';
 }
 
+/* ------------------------------------------------ VirtualAlloc placement log
+ *
+ * The cross-session wall is not pointers - the module reloc pass shifts those -
+ * and not threads, which the restore reports zero newer than the save. It is the
+ * game's own large VirtualAlloc reservations: a dozen MEM_PRIVATE/RW regions,
+ * ~340 MB, that no heap of ours claims and that Windows scatters to different
+ * addresses every launch. A byte snapshot of one only restores if it comes back
+ * at the same base - the very property the pinned arena gives the CRT heap, and
+ * the reason a heap at a fixed base reproduces its whole layout.
+ *
+ * Before pinning any of them we have to know the placement is worth pinning:
+ * that the sequence of big reservations - which call site, in what order, at
+ * what size - is the SAME up to the save point across two fresh launches. If it
+ * is, a deterministic (module, call site, ordinal) key can hand each region a
+ * stable slot in a reserved pool. If it is not, this log is what says so, and
+ * says what to key on instead.
+ *
+ * This changes nothing: every call is forwarded to the real VirtualAlloc. It
+ * only records, and only for reservations at or above the threshold. Off unless
+ * D3D9SW_VALOG=1; D3D9SW_VALOG_KB overrides the 1 MB floor. The return address
+ * is resolved to its module so a reservation made from ucrtbase or the game's
+ * mod hook is named by its own code, not misread as an executable offset. The
+ * offset is module-relative, so it is the same across launches despite ASLR -
+ * which is exactly the key a later pinning pass would use. */
+static LPVOID (WINAPI *r_valloc)(LPVOID, SIZE_T, DWORD, DWORD);
+static int g_valog;
+static SIZE_T g_valog_min = 1024u * 1024u;
+static volatile LONG g_valog_seq;
+/* Reentrancy guard for the LOGGING path only, shared by both hooks. It is a
+ * global interlocked try-lock, not a per-thread __thread latch: these hooks run
+ * on early and loader threads that do not yet have this DLL's thread-local
+ * storage set up, and touching a __thread there dereferences a null TLS array
+ * and faults (a mov ecx,[ecx+eax*4] with ecx=0). The allocation itself is always
+ * forwarded; only the logging - GetModuleFileNameA, ss_log - is fenced, and a
+ * re-entrant or concurrent caller that finds the lock held simply forwards and
+ * records nothing, which costs at most a missed log line. */
+static volatile LONG g_hooklog;
+
+static LPVOID WINAPI gh_valog(LPVOID addr, SIZE_T size, DWORD type, DWORD prot)
+{
+	void *ret = __builtin_return_address(0);
+	LPVOID (WINAPI *real)(LPVOID, SIZE_T, DWORD, DWORD) =
+		r_valloc ? r_valloc : VirtualAlloc;
+	LPVOID p = real(addr, size, type, prot);
+
+	if (g_valog && p && size >= g_valog_min && (type & MEM_RESERVE) &&
+	    InterlockedCompareExchange(&g_hooklog, 1, 0) == 0) {
+		HMODULE m = NULL;
+		uintptr_t mb = 0, off = (uintptr_t)ret;
+		char path[MAX_PATH], *name = (char *)"?";
+		unsigned ord;
+		long seq = InterlockedIncrement(&g_valog_seq) - 1;
+
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				       (LPCSTR)ret, &m) && m) {
+			char *s, *q;
+
+			mb = (uintptr_t)m;
+			off = (uintptr_t)ret - mb;
+			if (GetModuleFileNameA(m, path, sizeof(path))) {
+				for (s = path, q = path; *q; q++)
+					if (*q == '\\' || *q == '/')
+						s = q + 1;
+				name = s;
+			}
+		}
+		/* Keyed on (module-relative site, size), both stable across launches,
+		 * so the same site produces the same ordinal run in two sessions - the
+		 * thing a determinism diff compares. */
+		ord = gh_ordinal((unsigned)off, (unsigned)size);
+		ss_log("valog: #%ld  %-22s +%08lX ord %u  size %lu KB  "
+		       "type 0x%X prot 0x%X  -> base %08lX%s\n",
+		       seq, name, (unsigned long)off, ord,
+		       (unsigned long)(size >> 10), (unsigned)type, (unsigned)prot,
+		       (unsigned long)(uintptr_t)p,
+		       addr ? " (caller-fixed base)" : "");
+		InterlockedExchange(&g_hooklog, 0);
+	}
+	return p;
+}
+
+/* One layer down: NtAllocateVirtualMemory, the choke point every private
+ * reservation passes through - VirtualAlloc, VirtualAllocEx, and any direct Nt
+ * call all funnel here. The VirtualAlloc import net over 21 modules saw nothing,
+ * so the game's big regions either resolve VirtualAlloc via GetProcAddress or
+ * call Nt directly; either way they cross this line. Inline-hooked (the import
+ * table is no use - nobody imports the ntdll stub), log-only, so it names who
+ * allocates the 55-70 MB regions and becomes the point a pinning steer later
+ * plugs into. D3D9SW_NTLOG=1. */
+static LONG (WINAPI *r_ntav)(HANDLE, PVOID *, ULONG_PTR, PSIZE_T, ULONG, ULONG);
+static USHORT (NTAPI *r_backtrace)(ULONG, ULONG, PVOID *, PULONG);
+static int g_ntlog;
+static volatile LONG g_ntstack_left = 12; /* full call-chain dumps for amdxx32 */
+
+/* Basename of the module an address lands in, and the offset within it, into
+ * buf. "?" when the address is in no module (heap, stack, jitted). */
+static const char *gh_mod_of(const void *addr, char *buf, unsigned cap, uintptr_t *off)
+{
+	HMODULE m = NULL;
+
+	*off = (uintptr_t)addr;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			       (LPCSTR)addr, &m) &&
+	    m) {
+		char path[MAX_PATH], *s, *q;
+
+		*off = (uintptr_t)addr - (uintptr_t)m;
+		if (GetModuleFileNameA(m, path, sizeof(path))) {
+			for (s = path, q = path; *q; q++)
+				if (*q == '\\' || *q == '/')
+					s = q + 1;
+			lstrcpynA(buf, s, (int)cap);
+			return buf;
+		}
+	}
+	return "?";
+}
+
+static int gh_is_sys(const char *n)
+{
+	return !lstrcmpiA(n, "ntdll.dll") || !lstrcmpiA(n, "kernelbase.dll") ||
+	       !lstrcmpiA(n, "kernel32.dll");
+}
+
+/* ---- our own VirtualAlloc regions, for the software-exclude path -----------
+ *
+ * When D3D9SW_SWEXCLUDE arms the Nt hooks, every reservation whose originator is
+ * THIS DLL - the software renderer's textures, surfaces, framebuffers and
+ * GPU-present staging - is recorded here and dropped when freed, so
+ * build_exclusions can hold the live set in the present and out of the snapshot.
+ * They are ours and regenerable: the game re-creates its resources and
+ * gpu_dxgi_reconcile re-uploads the framebuffer after a restore.
+ *
+ * Open-addressed with the base as the claim word via CAS, so add and remove need
+ * no lock the loader could be holding. The table lives in this DLL's data, which
+ * is held in the present, so it survives a restore intact - the regions it names
+ * are held in the present too. */
+#define GH_OURVA_MAX 8192
+static volatile LONG g_ourva[GH_OURVA_MAX]; /* base, 0 = free slot */
+static SIZE_T g_ourva_size[GH_OURVA_MAX];
+static volatile LONG g_ourva_hw;   /* high-water mark for iteration */
+static volatile LONG g_ourva_full; /* adds dropped because the table was full */
+static HMODULE g_ourmod;           /* this DLL (d3d11.dll) */
+static int g_swexcl;
+
+static void ourva_add(uintptr_t base, SIZE_T size)
+{
+	int i;
+
+	if (!base)
+		return;
+	for (i = 0; i < GH_OURVA_MAX; i++) {
+		if (g_ourva[i] == 0 &&
+		    InterlockedCompareExchange(&g_ourva[i], (LONG)base, 0) == 0) {
+			LONG hw;
+
+			g_ourva_size[i] = size;
+			do {
+				hw = g_ourva_hw;
+				if (i < hw)
+					break;
+			} while (InterlockedCompareExchange(&g_ourva_hw, i + 1, hw) != hw);
+			return;
+		}
+	}
+	InterlockedIncrement(&g_ourva_full);
+}
+
+static void ourva_del(uintptr_t base)
+{
+	int i, hw = g_ourva_hw;
+
+	if (!base)
+		return;
+	for (i = 0; i < hw; i++)
+		if ((uintptr_t)(LONG)g_ourva[i] == base) {
+			InterlockedExchange(&g_ourva[i], 0);
+			return;
+		}
+}
+
+/* A subsystem inside this DLL that must be REWOUND with the game rather than held
+ * in the present - the software audio, whose voice and PCM buffers seam into a
+ * malformed stream if they stay present-tense while the game's audio state winds
+ * back - calls this right after its VirtualAlloc to drop the region the ORIGIN
+ * hook just recorded. Renderer memory (the reason SWEXCLUDE exists) is not
+ * unheld; only the caller's own regions are. */
+void gameheap_va_unhold(void *base)
+{
+	ourva_del((uintptr_t)base);
+}
+
+int gameheap_own_va_ranges(uintptr_t *base, uintptr_t *size, int max)
+{
+	int i, hw = g_ourva_hw, n = 0;
+
+	for (i = 0; i < hw && n < max; i++) {
+		uintptr_t b = (uintptr_t)(LONG)g_ourva[i];
+
+		if (b) {
+			base[n] = b;
+			size[n] = (uintptr_t)g_ourva_size[i];
+			n++;
+		}
+	}
+	return n;
+}
+
+static LONG WINAPI gh_ntav(HANDLE proc, PVOID *base, ULONG_PTR zb, PSIZE_T size,
+			   ULONG type, ULONG prot)
+{
+	void *ret = __builtin_return_address(0);
+	/* Forward first, always, on any thread - no thread-local touched here, so a
+	 * loader thread without our TLS cannot fault (the __thread version did). */
+	LONG st = r_ntav(proc, base, zb, size, type, prot);
+	SIZE_T got = size ? *size : 0;
+	void *rbase;
+	void *bt[32];
+	USHORT nfr = 0;
+	char onm[64] = "?";
+	uintptr_t ooff = 0;
+	int ours = 0;
+
+	/* Only a successful self reservation is ours to track or log. */
+	if ((!g_ntlog && !g_swexcl) || st < 0 || proc != (HANDLE)(LONG_PTR)-1 ||
+	    !(type & MEM_RESERVE))
+		return st;
+	rbase = base ? *base : NULL;
+
+	/* Originator: walk past the system layers (this stub, ntdll, kernelbase's
+	 * VirtualAllocEx, kernel32) to the first frame in real code. That module is
+	 * whose allocation this is - our renderer (hold it in the present) or the
+	 * game / Steam (leave it). Needed for both the log and the exclude, so it
+	 * runs outside the log lock. The whole frame array is kept so the log can
+	 * dump the full chain when it is hunting who pulls a driver in. */
+	if (r_backtrace) {
+		int fi;
+
+		nfr = r_backtrace(1, 32, bt, NULL);
+		for (fi = 0; fi < nfr; fi++) {
+			char tn[64];
+			uintptr_t to;
+			HMODULE fm = NULL;
+			const char *tnm = gh_mod_of(bt[fi], tn, sizeof(tn), &to);
+
+			if (tnm[0] == '?' || gh_is_sys(tnm))
+				continue;
+			lstrcpynA(onm, tnm, sizeof(onm));
+			ooff = to;
+			GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+					   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					   (LPCSTR)bt[fi], &fm);
+			ours = (fm && fm == g_ourmod);
+			break;
+		}
+	}
+
+	/* Record ours for exclusion - any size, no scope floor, lock-free table. */
+	if (g_swexcl && ours && rbase)
+		ourva_add((uintptr_t)rbase, got);
+
+	if (g_ntlog && got >= g_valog_min &&
+	    InterlockedCompareExchange(&g_hooklog, 1, 0) == 0) {
+		char inm[64];
+		uintptr_t ioff;
+		const char *iname = gh_mod_of(ret, inm, sizeof(inm), &ioff);
+		long seq = InterlockedIncrement(&g_valog_seq) - 1;
+
+		ss_log("ntlog: #%ld  via %s+%lX  ORIGIN %s+%lX  size %lu KB  type 0x%X "
+		       "prot 0x%X  -> base %08lX%s\n",
+		       seq, iname, (unsigned long)ioff, onm, (unsigned long)ooff,
+		       (unsigned long)(got >> 10), (unsigned)type, (unsigned)prot,
+		       (unsigned long)(uintptr_t)rbase, ours ? "  [OURS->held]" : "");
+		/* The whole call chain for the driver we are hunting, a few times, so
+		 * the frame ABOVE the amdxx32 frames names who actually pulled it in
+		 * (our code, the game, DXGI, DWM). Capped so the log stays readable. */
+		if (!lstrcmpiA(onm, "amdxx32.dll") && g_ntstack_left > 0 &&
+		    InterlockedDecrement(&g_ntstack_left) >= 0) {
+			int fi;
+
+			ss_log("  ntstack #%ld - who pulled in amdxx32:\n", seq);
+			for (fi = 0; fi < nfr; fi++) {
+				char tn[80];
+				uintptr_t to;
+				const char *tnm = gh_mod_of(bt[fi], tn, sizeof(tn), &to);
+
+				ss_log("      [%2d] %-22s +%lX\n", fi, tnm,
+				       (unsigned long)to);
+			}
+		}
+		InterlockedExchange(&g_hooklog, 0);
+	}
+	return st;
+}
+
+/* NtFreeVirtualMemory, so a released renderer region leaves the owned table and
+ * cannot go stale - which would hold in the present an address the game may take
+ * next. Base is read before the call, since MEM_RELEASE can clear it. Only self
+ * releases matter; a decommit keeps the reservation. */
+static LONG (WINAPI *r_ntfv)(HANDLE, PVOID *, PSIZE_T, ULONG);
+
+static LONG WINAPI gh_ntfv(HANDLE proc, PVOID *base, PSIZE_T size, ULONG freetype)
+{
+	uintptr_t b = (g_swexcl && base && proc == (HANDLE)(LONG_PTR)-1 &&
+		       (freetype & MEM_RELEASE))
+			      ? (uintptr_t)*base
+			      : 0;
+	LONG st = r_ntfv(proc, base, size, freetype);
+
+	if (b && st >= 0)
+		ourva_del(b);
+	return st;
+}
+
+/* Inline-detour one ntdll export. The x86 WOW64 stub opens with
+ * `mov eax, <service number>` (B8 imm32, 5 bytes) - a whole, position-independent
+ * instruction - so 5 bytes displace cleanly. Refuse anything else rather than
+ * corrupt an unknown prologue. The displaced bytes plus a jump back become the
+ * trampoline, returned in *realout for the hook to forward through. */
+static int ntdll_inline_hook(const char *name, void *hookfn, void **realout)
+{
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+	unsigned char *t = nt ? (unsigned char *)GetProcAddress(nt, name) : NULL;
+	unsigned char *tr;
+	DWORD old;
+
+	*realout = NULL;
+	if (!t) {
+		ss_log("gameheap: NT hook - %s not found\n", name);
+		return 0;
+	}
+	if (t[0] != 0xB8) {
+		ss_log("gameheap: NT hook - %s stub at %p starts 0x%02X, not the expected "
+		       "B8; not hooking\n",
+		       name, (void *)t, t[0]);
+		return 0;
+	}
+	tr = (unsigned char *)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE,
+					   PAGE_EXECUTE_READWRITE);
+	if (!tr) {
+		ss_log("gameheap: NT hook - trampoline page refused for %s\n", name);
+		return 0;
+	}
+	memcpy(tr, t, 5);     /* the displaced mov eax, SSN */
+	tr[5] = 0xE9;         /* jmp back to the rest of the stub */
+	*(LONG *)(tr + 6) = (LONG)((t + 5) - (tr + 10));
+	*realout = tr;
+	if (!VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &old)) {
+		ss_log("gameheap: NT hook - could not make %s writable\n", name);
+		VirtualFree(tr, 0, MEM_RELEASE);
+		*realout = NULL;
+		return 0;
+	}
+	t[0] = 0xE9; /* jmp hookfn */
+	*(LONG *)(t + 1) = (LONG)((unsigned char *)hookfn - (t + 5));
+	VirtualProtect(t, 5, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), t, 5);
+	ss_log("gameheap: NT hook - %s inline-detoured at %p, trampoline %p\n", name,
+	       (void *)t, (void *)tr);
+	return 1;
+}
+
+/* Arms the allocation hook (always) and, for the software-exclude path, the free
+ * hook too. g_ntlog / g_swexcl must already be set so the detours behave the
+ * moment they are wired. */
+static int nt_hooks_install(int with_free)
+{
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+
+	if (!nt)
+		return 0;
+	r_backtrace = (USHORT(NTAPI *)(ULONG, ULONG, PVOID *, PULONG))GetProcAddress(
+		nt, "RtlCaptureStackBackTrace");
+	/* This DLL, so the originator walk can tell our own reservations apart. */
+	GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			   (LPCSTR)&gh_ntav, &g_ourmod);
+	if (!ntdll_inline_hook("NtAllocateVirtualMemory", (void *)gh_ntav,
+			       (void **)&r_ntav)) {
+		g_ntlog = g_swexcl = 0;
+		return 0;
+	}
+	if (with_free) {
+		if (!ntdll_inline_hook("NtFreeVirtualMemory", (void *)gh_ntfv,
+				       (void **)&r_ntfv))
+			ss_log("gameheap: SWEXCLUDE - free hook failed; held regions would "
+			       "go stale on free, so exclusion is UNSAFE - disabling it\n");
+		if (!r_ntfv)
+			g_swexcl = 0; /* no free tracking -> do not record, to stay safe */
+	}
+	ss_log("gameheap: NT hooks armed - alloc%s, this DLL %p. %s\n",
+	       (with_free && r_ntfv) ? "+free" : "", (void *)g_ourmod,
+	       g_swexcl ? "SWEXCLUDE: renderer VirtualAlloc regions are held in the "
+			  "present and rebuilt on restore"
+		        : (g_ntlog ? "NTLOG: logging only" : "inactive"));
+	return 1;
+}
+
 int gameheap_install(void)
 {
 	HMODULE exe = GetModuleHandleA(NULL);
@@ -1698,6 +2099,103 @@ int gameheap_install(void)
 				       : "nothing is redirected; the outline prints in the report");
 		}
 	}
+	{
+		char vv[16];
+
+		if (savestate_getenv("D3D9SW_VALOG", vv, sizeof(vv)) > 0 && vv[0] == '1') {
+			/* Every loaded module's import of VirtualAlloc, not just the exe and
+			 * the CRT: the first pass hooked those two and saw nothing, so the
+			 * 55-70 MB regions a cross-session restore drops are placed from some
+			 * other module (or below kernel32 entirely). Cast the net over all of
+			 * them, minus our own shims, whose reservations we do not carry. If
+			 * this still shows nothing, the path is GetProcAddress-resolved or a
+			 * direct Nt call and the hook has to go one layer down. */
+			static const char *const ours[] = {
+				"d3d11.dll", "dxgi.dll", "xaudio2_9.dll", "xinput1_4.dll",
+				"dsound.dll", "opengl32.dll", "d3d9.dll", "d3d9_sw.dll",
+				/* The core allocators: hooking their VirtualAlloc import is
+				 * both pointless (heap growth goes through
+				 * NtAllocateVirtualMemory, not kernel32!VirtualAlloc, and
+				 * these do not call their own export via an import) and
+				 * hazardous - they run under the loader lock, where our
+				 * logging path can deadlock. The game's own big allocations
+				 * come from the exe and its libraries, never from here. */
+				"ntdll.dll", "kernel32.dll", "kernelbase.dll"
+			};
+			char kb[16];
+			int total = 0, hooked = 0, skipped = 0;
+			HANDLE snap;
+
+			if (savestate_getenv("D3D9SW_VALOG_KB", kb, sizeof(kb)) > 0) {
+				unsigned k = 0, ci;
+
+				for (ci = 0; kb[ci] >= '0' && kb[ci] <= '9'; ci++)
+					k = k * 10u + (unsigned)(kb[ci] - '0');
+				if (k)
+					g_valog_min = (SIZE_T)k * 1024u;
+			}
+			snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+			if (snap != INVALID_HANDLE_VALUE) {
+				MODULEENTRY32 me;
+
+				me.dwSize = sizeof(me);
+				if (Module32First(snap, &me)) {
+					do {
+						unsigned oi, mine = 0;
+						void *prev = NULL;
+						int n;
+
+						for (oi = 0; oi < sizeof(ours) / sizeof(ours[0]); oi++)
+							if (!lstrcmpiA(me.szModule, ours[oi])) {
+								mine = 1;
+								break;
+							}
+						if (mine) {
+							skipped++;
+							continue;
+						}
+						n = savestate_patch_iat_named((HMODULE)me.hModule,
+									      "KERNEL32.dll",
+									      "VirtualAlloc",
+									      (void *)gh_valog, &prev);
+						if (!n)
+							n = savestate_patch_iat_named(
+								(HMODULE)me.hModule, NULL,
+								"VirtualAlloc", (void *)gh_valog,
+								&prev);
+						if (n && prev && !r_valloc)
+							r_valloc = (LPVOID(WINAPI *)(
+								LPVOID, SIZE_T, DWORD, DWORD))prev;
+						if (n)
+							hooked++;
+						total += n;
+					} while (Module32Next(snap, &me));
+				}
+				CloseHandle(snap);
+			}
+			g_valog = total > 0;
+			ss_log("gameheap: VALOG %s - %d VirtualAlloc import slot(s) across %d "
+			       "module(s) (%d of ours skipped), logging reservations >= %lu KB "
+			       "by (module, call site, ordinal). Forwarded unchanged; only "
+			       "records placement%s\n",
+			       g_valog ? "ON" : "FAILED", total, hooked, skipped,
+			       (unsigned long)(g_valog_min >> 10),
+			       g_valog ? "" : " - no VirtualAlloc import found to patch");
+		}
+	}
+	{
+		char nl[8], sx[8];
+		int ntlog = savestate_getenv("D3D9SW_NTLOG", nl, sizeof(nl)) > 0 &&
+			    nl[0] == '1';
+		int swx = savestate_getenv("D3D9SW_SWEXCLUDE", sx, sizeof(sx)) > 0 &&
+			  sx[0] == '1';
+
+		if (ntlog || swx) {
+			g_ntlog = ntlog;
+			g_swexcl = swx;
+			nt_hooks_install(swx); /* alloc always; free hook only for exclude */
+		}
+	}
 	clock_probe_install(exe);
 	savestate_game_heap(g_heap);
 	ss_log("gameheap: %d of %d allocator site(s) in the game's own code now run "
@@ -1740,7 +2238,17 @@ int gameheap_install(void)
  * and if it is ever wrong, gh_malloc already falls back to the runtime and
  * g_fellback counts it, so the failure is a report rather than a crash.
  */
-#define GH_PIN_BASE 0x50000000u
+/* 0x20000000, not 0x50000000: the startup probe (d3d11_sw arena_probe) measured
+ * the largest contiguous free hole at each candidate base, and 0x20000000 has by
+ * far the most room (~1.15 GB early vs ~0.4 GB at 0x50000000). At 128 MB either
+ * base takes, but 0x50000000 could not fit a larger arena - the 512 MB attempt
+ * there failed with error 487 and fell back to an OS-placed base, which is NOT
+ * the same address next session and so breaks cross-session pointers. Pinning at
+ * 0x20000000 keeps the fixed base for any arena size we are likely to want,
+ * meaning the arena stays DETERMINISTIC across sessions and drops out of the
+ * relocation problem entirely. The d3d11 texture arena is steered off this base
+ * so the two do not fight for it. */
+#define GH_PIN_BASE 0x20000000u
 
 static PVOID(NTAPI *p_RtlCreateHeap)(ULONG, PVOID, SIZE_T, SIZE_T, PVOID, PVOID);
 
@@ -1798,12 +2306,32 @@ static HANDLE gh_create_heap(void)
 	 * produce a session whose traces quietly do not compare. */
 	res = VirtualAlloc((LPVOID)base, size, MEM_RESERVE, PAGE_READWRITE);
 	if (!res || (uintptr_t)res != base) {
-		ss_log("gameheap: cannot reserve %u MB at %08lX (got %p, error %lu) - "
-		       "falling back to HeapCreate\n",
-		       mb, (unsigned long)base, res, GetLastError());
-		if (res)
+		DWORD err = GetLastError();
+
+		if (res) {
 			VirtualFree(res, 0, MEM_RELEASE);
-		return HeapCreate(0, 1u << 20, 0);
+			res = NULL;
+		}
+		/* The fixed base is routinely occupied - 0x50000000 loses to whatever ASLR
+		 * or a module put there - and the old answer was a growable HeapCreate,
+		 * which cannot be pinned OR wholesale-restored (its segments come and go
+		 * outside any bounded region). An OS-placed reservation of the SAME size is
+		 * just as ownable and just as wholesale-able; it only gives up the fixed
+		 * base, which determinism wants but survival does not. So prefer it, and
+		 * keep HeapCreate as the last resort only. This is what lets D3D9SW_WHOLESALE
+		 * engage without D3D9SW_LAA_FALSE, since the arena is now always bounded. */
+		res = VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_READWRITE);
+		if (!res) {
+			ss_log("gameheap: cannot reserve %u MB at %08lX (error %lu) nor "
+			       "anywhere else (error %lu) - falling back to a growable "
+			       "HeapCreate that cannot be wholesale-restored\n",
+			       mb, (unsigned long)base, err, GetLastError());
+			return HeapCreate(0, 1u << 20, 0);
+		}
+		ss_log("gameheap: could not pin %u MB at %08lX (error %lu); reserved it "
+		       "OS-placed at %08lX instead - bounded and wholesale-able, just not "
+		       "at the fixed base (determinism traces will not compare)\n",
+		       mb, (unsigned long)base, err, (unsigned long)(uintptr_t)res);
 	}
 	h = (HANDLE)p_RtlCreateHeap(0, res, size, 1u << 20, NULL, NULL);
 	if (!h) {
@@ -1920,6 +2448,32 @@ static void gh_make_selfcontained(HANDLE h)
 
 	if (h)
 		HeapSetInformation(h, HeapCompatibilityInformation, &std, sizeof(std));
+}
+
+/* The owned-heap base anchors for a relocatable (cross-session) restore. A saved
+ * pointer into the arena is base+offset with a STABLE offset (the whole point of
+ * the pin), so cross-session it becomes new_base+offset - all the relocation pass
+ * needs is the base recorded at save and the new base read here at restore.
+ * Modules (the exe included) are anchored separately by the savestate module
+ * table; this covers the non-module owned heaps. Stable order: arena, then the
+ * LAA_FALSE region. Writes up to `max` {base,size} pairs, returns the count.
+ * Ranges are reported ONLY when bounded (a pinned or OS-placed reservation) -
+ * a growable HeapCreate fallback has no fixed extent to relocate against. */
+int gameheap_anchor_ranges(uintptr_t *base, uintptr_t *size, int max)
+{
+	int n = 0;
+
+	if (g_heap_lo && g_heap_hi && n < max) {
+		base[n] = g_heap_lo;
+		size[n] = g_heap_hi - g_heap_lo;
+		n++;
+	}
+	if (g_laa_lo && g_laa_hi && n < max) {
+		base[n] = g_laa_lo;
+		size[n] = g_laa_hi - g_laa_lo;
+		n++;
+	}
+	return n;
 }
 
 int gameheap_owned_heap(uintptr_t base)
@@ -2613,6 +3167,196 @@ void gameheap_report(void)
 				       (long)g_floor[i].count, g_floor[i].bytes);
 		}
 	}
+}
+
+/* ---- heap census: the definitive size of the boundary we would own ---------
+ *
+ * The allocation floor above sees only what flows through the EXE's patched
+ * HeapAlloc IAT. This measures the truth underneath: every heap the process has
+ * (GetProcessHeaps), and for each its committed and live-busy bytes, block
+ * count, biggest block, and a size histogram - walked directly with HeapWalk. It
+ * answers the one question the "become the game's allocator" plan turns on: is
+ * the game's live state a 50 MB boundary or a 1 GB one, and is it one heap or
+ * many. The game's runtime (MSVCR100 via DxLib) makes its own heap with
+ * HeapCreate, so it shows up here as a [game/other] heap distinct from our arena
+ * and the process default.
+ *
+ * Read-only; forwarded to nobody. Must run while all threads are still LIVE, so
+ * HeapLock can serialise each walk normally - walking a heap whose lock a
+ * suspended thread holds would hang, which is why the save calls this BEFORE it
+ * freezes. Each heap is guarded and skipped on failure so one uncooperative heap
+ * never sinks the census, and the walk is bounded. 32-bit process, so every size
+ * fits unsigned long as KB (wvsprintfA has no %llu). Off unless D3D9SW_HEAPCENSUS
+ * is set - it walks every block, so it is not free. */
+void gameheap_heap_census(void)
+{
+	char v[8], v2[8];
+	DWORD wc = savestate_getenv("D3D9SW_HEAPCENSUS", v, sizeof(v));
+	DWORD wa = savestate_getenv("D3D9SW_ASSETEXCL", v2, sizeof(v2));
+	int census_on = (wc > 0 && wc < sizeof(v) && v[0] == '1');
+	int asset_on = (wa > 0 && wa < sizeof(v2) && v2[0] == '1');
+	HANDLE heaps[128];
+	DWORD nheaps, i;
+	HANDLE def = GetProcessHeap();
+	unsigned long tot_commit_kb = 0, tot_busy_kb = 0, tot_blocks = 0;
+	char exe_path[MAX_PATH], *exe_base = exe_path;
+	DWORD el;
+
+	/* The walk runs for either knob: the census logs, or ASSETEXCL needs the same
+	 * per-heap profile to decide which heaps to hand savestate for holding. */
+	if (!census_on && !asset_on)
+		return;
+
+	/* The game's own module name, so a busy block whose first word points into it
+	 * is a game object (vtable/self-pointer) rather than a Windows one. */
+	el = GetModuleFileNameA(NULL, exe_path, sizeof(exe_path));
+	if (el && el < sizeof(exe_path)) {
+		char *q;
+
+		for (q = exe_path; *q; q++)
+			if (*q == '\\' || *q == '/')
+				exe_base = q + 1;
+	} else {
+		lstrcpynA(exe_path, "?", sizeof(exe_path));
+	}
+
+	nheaps = GetProcessHeaps(128, heaps);
+	if (!nheaps) {
+		ss_log("heapcensus: GetProcessHeaps returned 0 (err %lu)\n",
+		       GetLastError());
+		return;
+	}
+	ss_log("heapcensus: %lu process heap(s); default=%08lX ours-arena=%08lX "
+	       "ours-laa=%08lX\n",
+	       nheaps, (unsigned long)(uintptr_t)def, (unsigned long)(uintptr_t)g_heap,
+	       (unsigned long)(uintptr_t)g_laa_heap);
+	if (nheaps > 128)
+		nheaps = 128;
+
+	for (i = 0; i < nheaps; i++) {
+		HANDLE h = heaps[i];
+		PROCESS_HEAP_ENTRY e;
+		unsigned long commit_kb = 0, busy_kb = 0, blocks = 0, regions = 0;
+		unsigned long hist[6];        /* <256B <4K <64K <256K <1M >=1M */
+		unsigned long maxblk = 0;
+		unsigned long guard = 0;
+		/* PROBE 1 - content owner attribution: which module the first word of each
+		 * busy block points into. game = the EXE (a game object), ourmod = our
+		 * shims, othermod = any other DLL (Windows/Steam), data = not a pointer.
+		 * A heap dominated by game pointers is the game's private heap - a
+		 * pin-candidate we can own wholesale; one dominated by othermod pointers is
+		 * Windows'/Steam' and must stay in the present. Sampling is capped so 15k
+		 * blocks do not turn into 15k loader-lock lookups. */
+		unsigned long c_game = 0, c_ours = 0, c_mod = 0, c_data = 0, sampled = 0;
+		/* PROBE 2 - content signature: a cheap rolling hash over every busy block
+		 * (size + first word). Two census runs across a map transition can be
+		 * diffed: a heap whose sig turns over wholesale while size holds is ASSETS
+		 * the game reloaded (exclude, do not own); a stable sig is STATE (own). */
+		unsigned long sig = 0;
+		int locked, walked = 0, k;
+		int ours = (h == g_heap) || (g_laa_heap && h == g_laa_heap);
+		const char *tag = (h == g_heap) ? " [OURS arena]" :
+				  (g_laa_heap && h == g_laa_heap) ? " [OURS laa]" :
+				  (h == def) ? " [default]" : " [game/other]";
+
+		for (k = 0; k < 6; k++)
+			hist[k] = 0;
+
+		locked = HeapLock(h) ? 1 : 0;
+		memset(&e, 0, sizeof(e));
+		while (HeapWalk(h, &e)) {
+			walked = 1;
+			if (e.wFlags & PROCESS_HEAP_REGION) {
+				regions++;
+				commit_kb += (unsigned long)((e.Region.dwCommittedSize +
+							     1023) >> 10);
+			} else if (e.wFlags & PROCESS_HEAP_ENTRY_BUSY) {
+				unsigned long sz = (unsigned long)e.cbData;
+
+				blocks++;
+				busy_kb += (sz + 1023) >> 10;
+				if (sz > maxblk)
+					maxblk = sz;
+				if (sz < 256) hist[0]++;
+				else if (sz < 4096) hist[1]++;
+				else if (sz < 65536) hist[2]++;
+				else if (sz < 262144) hist[3]++;
+				else if (sz < 1048576) hist[4]++;
+				else hist[5]++;
+				if (sz >= 4 && e.lpData) {
+					unsigned long w =
+						*(volatile unsigned long *)e.lpData;
+
+					sig = sig * 1000003ul + w + sz;
+					if (sampled < 512) {
+						char mn[64];
+						uintptr_t mo;
+						const char *m = gh_mod_of(
+							(const void *)(uintptr_t)w,
+							mn, sizeof(mn), &mo);
+						sampled++;
+						if (m[0] == '?')
+							c_data++;
+						else if (!lstrcmpiA(m, exe_base))
+							c_game++;
+						else if (!lstrcmpiA(m, "d3d11.dll") ||
+							 !lstrcmpiA(m, "dxgi.dll") ||
+							 !lstrcmpiA(m, "xaudio2_9.dll") ||
+							 !lstrcmpiA(m, "xinput1_4.dll"))
+							c_ours++;
+						else
+							c_mod++;
+					}
+				}
+			}
+			if (++guard > 20000000ul)
+				break;          /* bound the walk */
+		}
+		if (locked)
+			HeapUnlock(h);
+
+		if (!walked) {
+			ss_log("heapcensus: heap %08lX%s - HeapWalk yielded nothing "
+			       "(err %lu)\n",
+			       (unsigned long)(uintptr_t)h, tag, GetLastError());
+			continue;
+		}
+		ss_log("heapcensus: heap %08lX%s - committed %lu KB, busy %lu KB in %lu "
+		       "block(s), %lu region(s), biggest %lu KB\n",
+		       (unsigned long)(uintptr_t)h, tag, commit_kb, busy_kb, blocks,
+		       regions, (maxblk + 1023) >> 10);
+		ss_log("    sizes: <256B %lu, <4K %lu, <64K %lu, <256K %lu, <1M %lu, "
+		       ">=1M %lu\n",
+		       hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
+		ss_log("    owner (of %lu sampled): game %lu, ours %lu, othermod %lu, "
+		       "data %lu; sig %08lX%s\n",
+		       sampled, c_game, c_ours, c_mod, c_data, sig,
+		       (!ours && sampled && c_game > c_mod && c_game >= c_data)
+			       ? "  <<< GAME-dominated private heap - pin candidate"
+			       : "");
+		/* Option 3: a large, pure-data, non-default, non-ours HeapCreate heap with
+		 * (almost) no code pointers is the game's asset heap - the one that
+		 * ballooned across the room change. Hand it to savestate to hold in the
+		 * present so the game reloads it, instead of rewinding it to a moved base.
+		 * The ~2 game-pointer slack tolerates a stray vtable in an asset wrapper. */
+		if (asset_on && !ours && h != def && commit_kb >= 1024 && sampled &&
+		    c_data * 10 >= sampled * 9 && c_game <= 2) {
+			savestate_note_asset_heap(h);
+			ss_log("    -> ASSETEXCL: heap %08lX marked regenerable ASSET - it "
+			       "will be held in the present and reloaded by the game\n",
+			       (unsigned long)(uintptr_t)h);
+		}
+		if (!ours) {
+			tot_commit_kb += commit_kb;
+			tot_busy_kb += busy_kb;
+			tot_blocks += blocks;
+		}
+	}
+	ss_log("heapcensus: NON-OURS total - committed %lu KB (%lu MB), busy %lu KB "
+	       "(%lu MB), %lu block(s). THIS is the boundary to own for cross-session "
+	       "(arena is %u MB)\n",
+	       tot_commit_kb, tot_commit_kb >> 10, tot_busy_kb, tot_busy_kb >> 10,
+	       tot_blocks, g_pin_mb);
 }
 
 /* HEAPBLOCKS for this heap under Wine, without HeapWalk. Wine has no Windows

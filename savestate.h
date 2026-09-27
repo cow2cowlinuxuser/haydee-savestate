@@ -57,6 +57,14 @@ double savestate_live_ms(void);
  * every later rebuild of the exclusion list. */
 void savestate_exclude(void *p, size_t bytes);
 
+/* The pre-suspend heap census (gameheap.c) calls this for each heap it judges to
+ * be regenerable game ASSETS - a large, pure-data HeapCreate heap that balloons on
+ * a room change - when D3D9SW_ASSETEXCL is set. heaps_partition then holds those
+ * heaps in the present (heap_ours=0) instead of rewinding bytes that a cross-session
+ * restore would land at a moved base; the game reloads the assets itself. Handles
+ * are valid only within the save that noted them; the list is cleared each save. */
+void savestate_note_asset_heap(void *h);
+
 /* A setting's value, environment first and then d3d9_sw.cfg beside the log.
  * Returns the length written, 0 if unset.
  *
@@ -189,8 +197,15 @@ unsigned gameheap_busy_saved_count(void);
 int gameheap_busy_saved_at(unsigned i, void **head, size_t *total);
 void gameheap_busy_rewind(void);
 
-/* One slot. Each costs a full copy of the game's committed memory, which for
- * this title is well over a gigabyte of physical RAM. */
-#define SAVESTATE_SLOTS 1
+/* Save slots held at once. Each slot's captured BYTES live in its own section or
+ * slotfile (disk-backed under D3D9SW_SLOTFILE=1), so a slot costs ~1.8 MB of
+ * control-block metadata plus one snapshot's worth of storage - not a gigabyte of
+ * RAM apiece. Each slot restores independently because wholesale restore captures
+ * the owned heap whole, so two saves are two byte images with no shared address
+ * identity to chain them. Validate 2 before leaning on 3-4. Slot selection is by
+ * key: save-slot-N on g_vk_save+N, load-slot-N on g_vk_load+N (keep the save and
+ * load key bases at least SAVESTATE_SLOTS apart, or they overlap - the hotkey
+ * code warns). */
+#define SAVESTATE_SLOTS 4
 
 #endif

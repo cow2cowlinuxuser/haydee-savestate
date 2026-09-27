@@ -88,8 +88,12 @@ typedef struct Region {
  * - 256 bytes that can matter more than every texture in the snapshot. */
 #if defined(_M_IX86) || defined(__i386__)
 #define TEB_TLS_SLOTS 0xE10
+#define TIB_STACK_BASE 0x04  /* NT_TIB.StackBase, high end */
+#define TIB_STACK_LIMIT 0x08 /* NT_TIB.StackLimit, low committed end */
 #else
 #define TEB_TLS_SLOTS 0x1480
+#define TIB_STACK_BASE 0x08
+#define TIB_STACK_LIMIT 0x10
 #endif
 #define TLS_MINIMUM_SLOTS 64
 
@@ -98,6 +102,12 @@ typedef struct ThreadState {
 	DWORD pad[3];
 	void *tls[TLS_MINIMUM_SLOTS];
 	int have_tls;
+	/* The thread's stack range at save (TEB StackBase/StackLimit). A saved SP and
+	 * any pointer into this stack is stack_base-relative; cross-session the new
+	 * thread's stack lands elsewhere, so the relocation pass shifts them by
+	 * (new_stack_base - stack_base) when it adopts this thread. Zero if the TEB
+	 * could not be read. */
+	uintptr_t stack_base, stack_limit;
 	CONTEXT ctx __attribute__((aligned(16)));
 } ThreadState;
 
@@ -2017,6 +2027,15 @@ void gameheap_busy_rewind(void);
  * and all - instead of block by block, which is the address-reuse cure. 0 unless
  * the knob is set. Defined in gameheap.c. */
 int gameheap_owned_heap(uintptr_t base);
+/* Owned-heap base anchors (arena, then LAA region) for relocatable cross-session
+ * restore: writes up to `max` {base,size} pairs, returns the count. Defined in
+ * gameheap.c. The exe and DLLs are anchored separately by the module table. */
+int gameheap_anchor_ranges(uintptr_t *base, uintptr_t *size, int max);
+/* The renderer's own VirtualAlloc regions (ORIGIN d3d11.dll), recorded as they
+ * are allocated and dropped as they are freed, for build_exclusions to hold in
+ * the present. Empty unless D3D9SW_SWEXCLUDE armed the Nt hooks. */
+int gameheap_own_va_ranges(uintptr_t *base, uintptr_t *size, int max);
+void gameheap_heap_census(void);
 /* Names the gameheap block an address belongs to from the tag table, which lives
  * in our image and survives a rewind - so a zeroed post-restore block can still
  * report the call site, size and ordinal it was born with. 1 = block start,
@@ -3806,6 +3825,16 @@ enum { RECLAIM_OFF = 0, RECLAIM_GROW, RECLAIM_ALL };
 
 struct Slot {
 	int valid;
+	/* The witness snapshot: where the player was when THIS slot was saved, so a
+	 * restore of this slot checks against its own world rather than whatever was
+	 * saved most recently. Persistent per-slot. The transient wit_reg/wit_blk/
+	 * wit_why stay in Control because they describe the operation in flight, not
+	 * the stored save; do_load copies these five back into the active witness
+	 * before room_check so every g_ctl->wit_* reader sees the right save. */
+	uintptr_t wit_ent;
+	float wit_x, wit_y;
+	unsigned wit_map;
+	int wit_valid;
 	int nregs;
 	int nthreads;
 	unsigned long long bytes;
@@ -3823,6 +3852,12 @@ struct Slot {
 	int nmods;
 	uintptr_t mod_lo[SS_MAX_MODS], mod_hi[SS_MAX_MODS];
 	char mod_name[SS_MAX_MODS][32];
+	/* Base anchors for a relocatable (cross-session) restore, alongside the
+	 * module set above. These are the non-module owned heaps (arena, LAA region)
+	 * whose block offsets are deterministic, so a saved pointer base+offset can
+	 * become new_base+offset when the arena lands elsewhere next session. */
+	int nanchor;
+	uintptr_t anchor_base[4], anchor_size[4];
 	EventState events[SS_MAX_EVENTS];
 	TimeBase clock;
 	FileState files[SS_MAX_FILES];
@@ -4066,6 +4101,7 @@ typedef struct Control {
 	uintptr_t carry_ent;
 	unsigned carry_map;
 	DWORD anchor_tick;
+	DWORD load_tick; /* GetTickCount at the most recent restore, for elapsed-since */
 #define SS_FMT_SLOTS 64
 	int nheaps, heaps_listed;
 	HANDLE heap_h[SS_MAX_HEAPS];
@@ -4497,7 +4533,8 @@ static const char *const g_knobs[] = {
 	"D3D9SW_KEY_FROM",	  "D3D9SW_KEY_VK",
 	"D3D9SW_QUIT_AT",	  "D3D9SW_XINPUT",
 	"D3D9SW_LOAD_AT",
-	"D3D9SW_SAVE_VK",	  "D3D9SW_LOAD_VK"
+	"D3D9SW_SAVE_VK",	  "D3D9SW_LOAD_VK",
+	"D3D9SW_SLOT_VK"
 };
 
 /* Read every knob into the memo before the environment is closed for business.
@@ -6600,6 +6637,43 @@ static int heap_mode(void)
 	return v[0] == '2' ? 2 : v[0] == '0' ? 0 : 1;
 }
 
+/* Asset heaps flagged by the pre-suspend census (option 3, D3D9SW_ASSETEXCL).
+ * These are the game's own large pure-data HeapCreate heaps that grow on a room
+ * change - regenerable assets, not state. heaps_partition holds them in the
+ * present so the game reloads them, rather than rewinding bytes that cross-session
+ * arrive at a base Windows chose differently this launch. Handles mean nothing in
+ * another process, so the list lives only for the duration of one save and is
+ * cleared by asset_heaps_reset() before the census refills it. */
+static HANDLE g_asset_heaps[SS_MAX_HEAPS];
+static int g_n_asset_heaps;
+
+static void asset_heaps_reset(void)
+{
+	g_n_asset_heaps = 0;
+}
+
+void savestate_note_asset_heap(void *h)
+{
+	int i;
+
+	if (!h || g_n_asset_heaps >= SS_MAX_HEAPS)
+		return;
+	for (i = 0; i < g_n_asset_heaps; i++)
+		if (g_asset_heaps[i] == (HANDLE)h)
+			return; /* already noted this save */
+	g_asset_heaps[g_n_asset_heaps++] = (HANDLE)h;
+}
+
+static int is_asset_heap(HANDLE h)
+{
+	int i;
+
+	for (i = 0; i < g_n_asset_heaps; i++)
+		if (g_asset_heaps[i] == h)
+			return 1;
+	return 0;
+}
+
 static void heaps_partition(void)
 {
 	HANDLE list[SS_MAX_HEAPS];
@@ -6798,6 +6872,18 @@ static void heaps_partition(void)
 				       "it. The write set put 0.17 MB of change in all heaps "
 				       "combined against 15.81 MB outside them, which is the "
 				       "whole argument for doing this\n");
+		}
+		/* Option 3 (D3D9SW_ASSETEXCL): a heap the pre-suspend census judged to
+		 * be regenerable assets is held in the present regardless of the vote
+		 * above, so the game reloads it instead of the restore rewinding bytes to
+		 * a base that moved between launches. Applied after every other rule so it
+		 * wins, and only ever FLIPS a rewound heap to held - never the reverse. */
+		if (is_asset_heap(h) && g_ctl->heap_ours[k]) {
+			g_ctl->heap_ours[k] = 0;
+			if (first)
+				ss_log("    heap %p held in present as REGENERABLE ASSETS "
+				       "(D3D9SW_ASSETEXCL) - the game reloads it\n",
+				       (void *)h);
 		}
 		/* Wine has no HEAP_SEGMENT, so the segment-exclude loop below never
 		 * sees handle pages. linux 82fd84a held unnamed heaps only
@@ -10395,6 +10481,28 @@ static void build_exclusions(void)
 		}
 	}
 
+	/* Our own renderer's VirtualAlloc regions - textures, surfaces, framebuffers,
+	 * GPU-present staging - are ours and regenerable: the game re-creates its
+	 * resources and gpu_dxgi_reconcile re-uploads the framebuffer on restore. They
+	 * originate in d3d11.dll, land OS-placed, and so drift across a session, which
+	 * is the bulk of what a cross-session restore cannot put back. Holding them in
+	 * the present keeps them out of the snapshot entirely; the arena is already
+	 * excluded above by the wrapper's own module handling, this covers everything
+	 * else. gameheap records them as it sees d3d11.dll allocate, and drops them as
+	 * it frees, so this list is the live set at the instant of the save. */
+	{
+		uintptr_t ob[256], os[256];
+		int i, non = gameheap_own_va_ranges(ob, os, 256);
+
+		for (i = 0; i < non; i++)
+			ss_exclude_as("renderer VirtualAlloc, regenerated on restore",
+				      (void *)ob[i], (size_t)os[i]);
+		if (non)
+			ss_log("exclude: %d renderer VirtualAlloc region(s) held in the "
+			       "present - ours, the game rebuilds them\n",
+			       non);
+	}
+
 	ss_log("exclude: %d tebs, %d game stacks, %d system threads, %d library images, "
 	       "%ld total\n",
 	       nteb, nstack, ntrans, nmod, (long)g_ctl->nex);
@@ -10612,6 +10720,54 @@ static void win_close(Window *w)
 	w->size = 0;
 }
 
+/* Phase 1 bank window. A contiguous reservation held from setup through the whole
+ * session, released ONLY during a frozen checkpoint so the restore's views have a
+ * guaranteed contiguous hole to map into, then re-held for gameplay. Reserving it
+ * EARLY - before the game fragments the 2 GB - is what makes it available later,
+ * once the largest free block has shrunk below a view. Multiple concurrent windows
+ * (region, block, verify) all land in the freed span, so this is a block, not one
+ * fixed view. The whole point: the number and size of save slots is bounded by
+ * disk, not by finding a big hole at restore time. */
+#define SS_BANK_RESERVE (64u * 1024u * 1024u)
+static void *g_bank_reserve;
+static int g_bank_released;
+
+static void bank_reserve_init(void)
+{
+	if (g_bank_reserve || g_bank_released)
+		return;
+	g_bank_reserve = VirtualAlloc(NULL, SS_BANK_RESERVE, MEM_RESERVE, PAGE_READWRITE);
+	ss_log("bank: %s a %u MB contiguous reserve for checkpoint views%s\n",
+	       g_bank_reserve ? "held" : "COULD NOT hold", SS_BANK_RESERVE >> 20,
+	       g_bank_reserve
+		       ? " - restores get a guaranteed hole even when the address "
+			 "space is fragmented"
+		       : "; restores fall back to scavenging holes (the view retry)");
+}
+
+/* Free the reserve so the frozen checkpoint's views can land in the contiguous
+ * span. Only ever called inside the freeze, where nothing runs to grab it. */
+static void bank_release(void)
+{
+	if (g_bank_reserve) {
+		VirtualFree(g_bank_reserve, 0, MEM_RELEASE);
+		g_bank_reserve = NULL;
+		g_bank_released = 1;
+	}
+}
+
+/* Re-hold the span for gameplay so it is there for the next checkpoint. If the
+ * game fragmented the space while we were mapped, this may land elsewhere - still
+ * a 64 MB contiguous block, which is all the next restore needs. */
+static void bank_reacquire(void)
+{
+	if (g_bank_released) {
+		g_bank_reserve = VirtualAlloc(NULL, SS_BANK_RESERVE, MEM_RESERVE,
+					      PAGE_READWRITE);
+		g_bank_released = 0;
+	}
+}
+
 static int win_cover(Window *w, unsigned long long pos)
 {
 	unsigned long long start, want;
@@ -10630,8 +10786,36 @@ static int win_cover(Window *w, unsigned long long pos)
 	w->base = (unsigned char *)MapViewOfFile(w->sect, FILE_MAP_ALL_ACCESS,
 						 (DWORD)(start >> 32), (DWORD)start,
 						 (SIZE_T)want);
-	if (!w->base)
+	/* A 32-bit process holding the game, the arena and several ~780 MB save
+	 * sections has no 32 MB CONTIGUOUS hole to map a view into, even with plenty
+	 * of total address space free - MapViewOfFile returns ERROR_NOT_ENOUGH_MEMORY.
+	 * Falling the whole restore over a fragmented address space leaves the game
+	 * half-written; a smaller view almost always fits, at the cost of more slides.
+	 * Halve down to the allocation granularity before giving up. */
+	while (!w->base && want > gran) {
+		want /= 2;
+		if (want < gran)
+			want = gran;
+		w->base = (unsigned char *)MapViewOfFile(w->sect, FILE_MAP_ALL_ACCESS,
+							 (DWORD)(start >> 32),
+							 (DWORD)start, (SIZE_T)want);
+	}
+	if (!w->base) {
+		/* Capped diagnostic: pos past total is an accounting mismatch; pos
+		 * within total after shrinking to the granularity is genuine address-
+		 * space exhaustion, not fragmentation. */
+		static int said;
+
+		if (said++ < 6)
+			ss_log("  win_cover: MapViewOfFile failed even at %llu bytes - pos "
+			       "%llu, start %llu, total %llu, sect %p, error %lu%s\n",
+			       want, pos, start, w->total, (void *)w->sect,
+			       (unsigned long)GetLastError(),
+			       pos >= w->total ? " (pos is PAST total - region list outruns "
+						 "the captured bytes)"
+					       : " (address space is genuinely exhausted)");
 		return 0;
+	}
 	w->off = start;
 	w->size = want;
 	return 1;
@@ -11134,6 +11318,159 @@ static int exclskip_mode(void)
 	return cached;
 }
 
+/* Damn-the-torpedoes restore. Off by default.
+ *
+ * The refuse that guards a partial rewind is exactly right when the aim is a
+ * process that keeps running correctly - a restore that puts back most of the
+ * state and not the rest is worse than none. This knob is for the opposite aim:
+ * force every saved block back over whatever now occupies its address and watch
+ * what the game does with it. Regions that "belong elsewhere" or will not
+ * recommit no longer refuse the load; they are written where they can be and
+ * left in the present where they cannot, and the process is allowed to run on
+ * the result. The one thing still protected is what cannot be written without
+ * killing the restore itself: the running restore thread's stack and any peer
+ * still live are held back by win_copy_except_live, and every engine structure
+ * was excluded at the save so it was never in the region set to begin with. */
+static int exclforce_mode(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		char v[8];
+		DWORD n = ss_getenv("D3D9SW_EXCLFORCE", v, sizeof(v));
+
+		cached = (n > 0 && n < sizeof(v) && v[0] == '1') ? 1 : 0;
+	}
+	return cached;
+}
+
+/* Data-only restore: rewind the world, leave the runners. When set, do_load does
+ * NOT apply any saved thread context - no thread is wound back to the save, they
+ * all keep their current execution and read the rewound memory. Cross-session this
+ * is already what happens (the saved TIDs are gone, so nothing matches), and the
+ * thread_harness proved fresh threads pick up a rewound world with no adoption.
+ * The knob forces it IN-SESSION too, where the memory rewind is complete, so the
+ * model can be A/B'd against the resume-through-the-save hijack on clean memory.
+ * RESULT (2026-09-26): even in-session on complete memory the game freezes and
+ * dies quickly under this - the runners genuinely need their contexts. A game
+ * thread's execution is welded to the memory it was executing over; rewind the
+ * world without rewinding the thread and its next instruction operates on data
+ * that jumped, so it faults at once. Data-only cannot carry the game. The harness
+ * loop was too simple to model this. Kept for the record. Off by default. */
+static int dataonly_mode(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		char v[8];
+		DWORD n = ss_getenv("D3D9SW_DATAONLY", v, sizeof(v));
+
+		cached = (n > 0 && n < sizeof(v) && v[0] == '1') ? 1 : 0;
+	}
+	return cached;
+}
+
+/* Stack-address probe. Data-only is dead (see above): the game needs its threads
+ * wound back, contexts AND the stacks those contexts point into. In-session that
+ * is free - the saved threads still exist at the same stack addresses, so we
+ * rewind the same memory. Cross-session the saved threads are gone and adoption
+ * would mean: reserve the saved stack's address, restore its bytes, and point a
+ * fresh thread's context at it. That is only possible if the saved stack address
+ * is still FREE in the new process. thread_harness answered "occupied", but it
+ * respawned in the SAME process, where the OS handed the fresh threads the exact
+ * addresses the dead ones freed - a same-process artifact. A real cross-session
+ * restore is a NEW process, and the log shows thread stacks land at different
+ * addresses across launches (req thread 00AF1000 one run, 00CF1000 another). So
+ * the saved-stack addresses may well be free here. This probe measures it for the
+ * real game at real restore time: for every saved thread stack, VirtualQuery the
+ * range now and report free / reserved / committed. If most are free, adoption
+ * has a door the harness closed prematurely. On by default; it only reads. */
+static int stackprobe_mode(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		char v[8];
+		DWORD n = ss_getenv("D3D9SW_STACKPROBE", v, sizeof(v));
+
+		cached = (n > 0 && n < sizeof(v) && v[0] == '0') ? 0 : 1;
+	}
+	return cached;
+}
+
+static void stackprobe_report(const Slot *s)
+{
+	int i, with_stack = 0, freed = 0, reserved = 0, committed = 0, ours = 0;
+	uintptr_t req_lo = 0, req_hi = 0;
+	DWORD req_tid = g_ctl ? g_ctl->req_tid : 0;
+
+	if (!stackprobe_mode() || !s)
+		return;
+
+	for (i = 0; i < s->nthreads; i++) {
+		MEMORY_BASIC_INFORMATION mbi;
+		uintptr_t lo = s->threads[i].stack_limit;   /* low committed end */
+		uintptr_t hi = s->threads[i].stack_base;     /* high end */
+		const char *state = "?";
+		int is_req = (s->threads[i].tid == req_tid);
+
+		if (!hi)
+			continue;
+		with_stack++;
+		if (is_req) { req_lo = lo; req_hi = hi; }
+		if (VirtualQuery((LPCVOID)lo, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+			ss_log("  stackprobe: saved tid %u stack %08lX..%08lX - "
+			       "VirtualQuery failed (err %lu)\n",
+			       (unsigned)s->threads[i].tid, (unsigned long)lo,
+			       (unsigned long)hi, GetLastError());
+			continue;
+		}
+		if (mbi.State == MEM_FREE) { state = "FREE"; freed++; }
+		else if (mbi.State == MEM_RESERVE) { state = "RESERVED"; reserved++; }
+		else { state = "COMMITTED"; committed++; }
+		if (mbi.State != MEM_FREE && mbi.Type == MEM_PRIVATE &&
+		    (uintptr_t)mbi.AllocationBase != lo)
+			ours++;
+		/* Only the requesting thread and a handful of others are worth a line;
+		 * the summary carries the rest. */
+		if (is_req || i < 6 || mbi.State == MEM_FREE)
+			ss_log("  stackprobe: saved tid %u%s stack %08lX..%08lX now %s "
+			       "(base %08lX size %luK type %s)\n",
+			       (unsigned)s->threads[i].tid, is_req ? " [REQ]" : "",
+			       (unsigned long)lo, (unsigned long)hi, state,
+			       (unsigned long)(uintptr_t)mbi.AllocationBase,
+			       (unsigned long)(mbi.RegionSize >> 10),
+			       mbi.Type == MEM_PRIVATE ? "private" :
+			       mbi.Type == MEM_MAPPED ? "mapped" :
+			       mbi.Type == MEM_IMAGE ? "image" : "free");
+	}
+	ss_log("  stackprobe: %d saved stack(s): %d FREE, %d reserved, %d committed "
+	       "(%d re-tenanted) - adoption %s (req thread %08lX..%08lX)\n",
+	       with_stack, freed, reserved, committed, ours,
+	       freed == with_stack ? "OPEN: every saved stack address is free" :
+	       freed > 0 ? "PARTIAL: some saved stack addresses are free" :
+	       "CLOSED: no saved stack address is free",
+	       (unsigned long)req_lo, (unsigned long)req_hi);
+}
+
+/* On by default. A saved region that is a live file mapping at restore time
+ * cannot be written back - a section view is not a memcpy target - so holding it
+ * out is the only correct move, not a policy choice; the game re-maps the asset
+ * and reads from the mapping. This exists as a knob only so the old behaviour
+ * (count it as unrestorable and refuse) can be restored for comparison. */
+static int mapskip_mode(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		char v[8];
+		DWORD n = ss_getenv("D3D9SW_MAPSKIP", v, sizeof(v));
+
+		cached = (n > 0 && n < sizeof(v) && v[0] == '0') ? 0 : 1;
+	}
+	return cached;
+}
+
 #define SS_WATCH_MAX 8
 static uintptr_t g_watch_at[SS_WATCH_MAX];
 static int g_watch_at_n = -1;
@@ -11309,8 +11646,14 @@ void savestate_watch_tick(void)
 			continue;
 		memcpy(f, (const void *)a, sizeof(f));
 		memcpy(w, f, sizeof(w));
-		ss_log("  trace %s +%d %08lX: x %d.%02d y %d.%02d (%08lX %08lX)\n",
-		       g_trace_why, g_trace_frame, (unsigned long)a, (int)f[0],
+		/* Wall-clock since the last restore, so "frames" cannot be mistaken for
+		 * time: an unthrottled present loop over dead game logic ticks the frame
+		 * counter fast, and only a real clock tells that apart from play. */
+		ss_log("  trace %s +%d %lums %08lX: x %d.%02d y %d.%02d (%08lX %08lX)\n",
+		       g_trace_why, g_trace_frame,
+		       (g_ctl && g_ctl->load_tick) ?
+			       (unsigned long)(GetTickCount() - g_ctl->load_tick) : 0ul,
+		       (unsigned long)a, (int)f[0],
 		       (int)((f[0] < 0 ? -f[0] : f[0]) * 100.0f) % 100, (int)f[1],
 		       (int)((f[1] < 0 ? -f[1] : f[1]) * 100.0f) % 100,
 		       (unsigned long)w[0], (unsigned long)w[1]);
@@ -11595,6 +11938,40 @@ static void slotfile_write_index(int slotno, const Slot *s)
 			      (unsigned long)g_ctl->wit_ent, (int)g_ctl->wit_x,
 			      (int)g_ctl->wit_y, g_ctl->wit_map, xb, yb);
 		WriteFile(f, line, (DWORD)n, &wrote, NULL);
+	}
+	/* Module ranges, so an offline reader can tell a pointer into code or a
+	 * vtable from a pointer into the heap and from plain data - the three shift
+	 * differently across a relaunch, and separating them is the whole point of
+	 * comparing two saves. Emitted before the region table so a parser has them
+	 * in hand by the time it reads the bytes. */
+	for (i = 0; i < s->nmods; i++) {
+		n = wsprintfA(line, "# module %08lX %08lX %s\r\n",
+			      (unsigned long)s->mod_lo[i], (unsigned long)s->mod_hi[i],
+			      s->mod_name[i]);
+		WriteFile(f, line, (DWORD)n, &wrote, NULL);
+	}
+	/* Bands: address ranges a saved word can point INTO that are not captured
+	 * regions and not modules - the held heaps left in the present, and the
+	 * per-thread stacks, TEBs and PEB from the exclusion list. Without these an
+	 * offline reader cannot tell a pointer into the process heap from a data
+	 * word, so every such pointer reads as a content difference when it is only
+	 * an address that moved. Recording them lets the reader mask all pointer
+	 * classes and measure the divergence that is genuinely content. */
+	if (g_ctl) {
+		int b;
+
+		for (b = 0; b < g_ctl->nheaps; b++) {
+			n = wsprintfA(line, "# band %08lX %08lX heap\r\n",
+				      (unsigned long)g_ctl->heap_lo[b],
+				      (unsigned long)g_ctl->heap_hi[b]);
+			WriteFile(f, line, (DWORD)n, &wrote, NULL);
+		}
+		for (b = 0; b < g_ctl->nex; b++) {
+			n = wsprintfA(line, "# band %08lX %08lX excl\r\n",
+				      (unsigned long)g_ctl->ex_lo[b],
+				      (unsigned long)g_ctl->ex_hi[b]);
+			WriteFile(f, line, (DWORD)n, &wrote, NULL);
+		}
 	}
 	n = wsprintfA(line, "# base size offset prot\r\n");
 	WriteFile(f, line, (DWORD)n, &wrote, NULL);
@@ -12706,6 +13083,229 @@ static void ss_prime_module_table(void)
 	sort_modules();
 }
 
+/* Who owns the memory a save captures, and who owns what it leaves behind.
+ *
+ * The cross-session question is not "how much travels" but "of the part that
+ * does not come back, is it ours or the game's." Our renderer's regenerable
+ * scratch is fine to lose; the game's audio state is not - and the two have been
+ * indistinguishable inside a single coverage total, which is why a restore can
+ * bring the room back while the music dies referencing buffers that no longer
+ * exist. This buckets every committed writable region by owner and by whether
+ * the snapshot took it, so the next cross-session restore's unrestorable set can
+ * be read against a known composition.
+ *
+ * It also settles the 0x20000000 question directly. Two subsystems each log that
+ * base as theirs - the gameheap pin (committed, read-write) and the renderer
+ * arena (a 256 MB PAGE_NOACCESS reserve) - which cannot both hold it. So here we
+ * ask the OS what is actually there while every thread is stopped: if both are
+ * present, the window shows ~256 MB reserved-noaccess alongside the committed-RW
+ * heap; if one lost the base, its bytes are simply not in the window. Reads only
+ * - no allocation, no lock - so it is safe from inside the suspended save. */
+enum { OWN_GH = 0, OWN_OURS_MOD, OWN_GAME_EXE, OWN_SYS_MOD, OWN_GAME_PRIV, OWN_N };
+
+static int attrib_is_ours_mod(const char *n)
+{
+	static const char *const ours[] = {
+		"d3d11.dll", "dxgi.dll", "xaudio2_9.dll", "xinput1_4.dll",
+		"dsound.dll", "opengl32.dll", "d3d9.dll", "d3d9_sw.dll",
+		"d3d9_sw_ref.dll"
+	};
+	unsigned i;
+
+	for (i = 0; i < sizeof(ours) / sizeof(ours[0]); i++)
+		if (!lstrcmpiA(n, ours[i]))
+			return 1;
+	return 0;
+}
+
+static void save_attribution(const Slot *s)
+{
+	char v[8];
+	DWORD gn = ss_getenv("D3D9SW_ATTRIB", v, sizeof(v));
+	uintptr_t gh_base[4], gh_size[4];
+	MEMORY_BASIC_INFORMATION mbi;
+	uintptr_t a;
+	int ngh, i;
+
+	if (gn && v[0] == '0')
+		return; /* opt-out; on by default because it only reads and only at a save */
+
+	ngh = gameheap_anchor_ranges(gh_base, gh_size, 4);
+
+	/* --- base truth at the contested 0x20000000 --- */
+	{
+		uintptr_t used = 0, committed = 0, reserved = 0, noaccess = 0, rw = 0;
+		uintptr_t first_alloc = 0;
+
+		for (a = 0x20000000u; a < 0x40000000u &&
+		     VirtualQuery((LPCVOID)a, &mbi, sizeof(mbi)) == sizeof(mbi);) {
+			uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+
+			if (next <= a)
+				break;
+			a = next;
+			if (mbi.State == MEM_FREE)
+				continue;
+			if (!first_alloc && (uintptr_t)mbi.BaseAddress == 0x20000000u)
+				first_alloc = (uintptr_t)mbi.AllocationBase;
+			used += mbi.RegionSize;
+			if (mbi.State == MEM_COMMIT) {
+				committed += mbi.RegionSize;
+				if (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+						   PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+					rw += mbi.RegionSize;
+			} else if (mbi.State == MEM_RESERVE) {
+				reserved += mbi.RegionSize;
+			}
+			if (mbi.Protect & PAGE_NOACCESS)
+				noaccess += mbi.RegionSize;
+		}
+		ss_log("  base-truth: [20000000,40000000) alloc-base at 20000000 is %08lX; "
+		       "%.0f MB used = %.0f committed (%.0f MB RW) + %.0f reserved; %.0f MB "
+		       "PAGE_NOACCESS\n",
+		       (unsigned long)first_alloc, (double)used / 1048576.0,
+		       (double)committed / 1048576.0, (double)rw / 1048576.0,
+		       (double)reserved / 1048576.0, (double)noaccess / 1048576.0);
+		for (i = 0; i < ngh; i++)
+			ss_log("  base-truth: gameheap anchor %d claims %08lX + %.0f MB "
+			       "(committed-RW is the heap; the 256 MB NOACCESS reserve above "
+			       "would be the renderer arena sharing the base)\n",
+			       i, (unsigned long)gh_base[i], (double)gh_size[i] / 1048576.0);
+	}
+
+	/* --- who owns what the snapshot took, versus what it leaves in the present --- */
+	{
+		double cap_kb[OWN_N] = { 0 }, left_kb[OWN_N] = { 0 };
+		static const char *const label[OWN_N] = {
+			"gameheap (ours)", "our shim modules", "game exe",
+			"system modules", "game/other private"
+		};
+
+		for (a = 0; VirtualQuery((LPCVOID)a, &mbi, sizeof(mbi)) == sizeof(mbi);) {
+			uintptr_t base = (uintptr_t)mbi.BaseAddress, next = base + mbi.RegionSize;
+			int own = OWN_GAME_PRIV, captured = 0, j;
+			double kb;
+
+			if (next <= a)
+				break;
+			a = next;
+			if (mbi.State != MEM_COMMIT)
+				continue;
+			if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))
+				continue;
+			if (!(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+					     PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+				continue;
+			kb = (double)mbi.RegionSize / 1024.0;
+
+			for (j = 0; j < ngh; j++)
+				if (base >= gh_base[j] && base < gh_base[j] + gh_size[j]) {
+					own = OWN_GH;
+					break;
+				}
+			/* g_ctl's module census, not the slot's: the slot's copy is filled
+			 * later in do_save (after this runs), so reading it here would put
+			 * every module region in the private bucket - which is exactly the
+			 * 0.0 rows the first run showed. */
+			if (own == OWN_GAME_PRIV && g_ctl)
+				for (j = 0; j < g_ctl->nmods; j++)
+					if (base >= g_ctl->mod_lo[j] && base < g_ctl->mod_hi[j]) {
+						own = attrib_is_ours_mod(g_ctl->mod_name[j]) ? OWN_OURS_MOD
+						    : savestate_host_is(g_ctl->mod_name[j]) ? OWN_GAME_EXE
+						    : OWN_SYS_MOD;
+						break;
+					}
+			for (j = 0; j < s->nregs; j++)
+				if (base >= s->regs[j].base &&
+				    base < s->regs[j].base + s->regs[j].size) {
+					captured = 1;
+					break;
+				}
+			if (captured)
+				cap_kb[own] += kb;
+			else
+				left_kb[own] += kb;
+		}
+		ss_log("  attribution (committed writable, MB captured / left in the present):\n");
+		for (i = 0; i < OWN_N; i++)
+			ss_log("      %-20s %8.1f / %8.1f\n",
+			       label[i], cap_kb[i] / 1024.0, left_kb[i] / 1024.0);
+		ss_log("  attribution: \"left in the present\" for our own rows is regenerable "
+		       "scratch; for the game rows it is state a cross-session restore drops - "
+		       "the audio among it is why the music goes stale\n");
+	}
+}
+
+/* Free-address-space histogram (D3D9SW_FREEMAP=1). Walks the whole user address
+ * space and reports the MEM_FREE regions: a size histogram, the total, and the
+ * largest few holes WITH their base addresses. Run across several sessions, the
+ * bases of the big holes reveal which are DETERMINISTIC (same address every
+ * launch) - the proof of where a stable aperture can be planted, and how much
+ * room is left for a resident window without starving the game. Read-only; walks
+ * inside the save's quiet window like the census. 2 GB space, so every size fits
+ * unsigned long as KB/MB. */
+static void freemap_report(void)
+{
+	char v[8];
+	DWORD got = ss_getenv("D3D9SW_FREEMAP", v, sizeof(v));
+	MEMORY_BASIC_INFORMATION mbi;
+	uintptr_t addr = 0;
+	unsigned long total_mb = 0, hist[6];
+	int nfree = 0, ntop = 0, i;
+	struct { uintptr_t base; SIZE_T size; } top[8];
+
+	if (!(got > 0 && got < sizeof(v) && v[0] == '1'))
+		return;
+	memset(hist, 0, sizeof(hist));
+	memset(top, 0, sizeof(top));
+	while (VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+		uintptr_t base = (uintptr_t)mbi.BaseAddress;
+		uintptr_t next = base + mbi.RegionSize;
+
+		if (next <= addr)
+			break;
+		addr = next;
+		if (mbi.State != MEM_FREE)
+			continue;
+		{
+			SIZE_T sz = mbi.RegionSize;
+
+			nfree++;
+			total_mb += (unsigned long)(sz >> 20);
+			if (sz < 65536ul) hist[0]++;
+			else if (sz < 1048576ul) hist[1]++;
+			else if (sz < 16ul * 1048576) hist[2]++;
+			else if (sz < 64ul * 1048576) hist[3]++;
+			else if (sz < 256ul * 1048576) hist[4]++;
+			else hist[5]++;
+			/* Keep the 8 largest, sorted descending, by insertion. */
+			if (ntop < 8 || sz > top[7].size) {
+				int j = ntop < 8 ? ntop++ : 7;
+
+				top[j].base = base;
+				top[j].size = sz;
+				for (; j > 0 && top[j].size > top[j - 1].size; j--) {
+					uintptr_t tb = top[j].base;
+					SIZE_T ts = top[j].size;
+
+					top[j].base = top[j - 1].base;
+					top[j].size = top[j - 1].size;
+					top[j - 1].base = tb;
+					top[j - 1].size = ts;
+				}
+			}
+		}
+	}
+	ss_log("freemap: %d free region(s), %lu MB total; hist <64K:%lu <1M:%lu "
+	       "<16M:%lu <64M:%lu <256M:%lu >=256M:%lu\n",
+	       nfree, total_mb, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
+	ss_log("freemap: largest holes (base, size) - compare bases across sessions "
+	       "for a deterministic aperture site:\n");
+	for (i = 0; i < ntop; i++)
+		ss_log("    %08lX  %lu MB\n", (unsigned long)top[i].base,
+		       (unsigned long)(top[i].size >> 20));
+}
+
 static int do_save(int slotno)
 {
 	Slot *s = &g_ctl->slots[slotno];
@@ -12765,6 +13365,19 @@ static int do_save(int slotno)
 	ds_sw_report();
 	xa2_sw_report();
 	gameheap_report();
+	/* Cleared before the census refills it, so option 3's asset-heap list reflects
+	 * only this save. */
+	asset_heaps_reset();
+	/* Census every process heap while all threads are still live, so HeapLock can
+	 * serialise the walk (a suspended lock-holder would hang it). This is the
+	 * measurement that sizes the "own the allocator boundary" plan. Read-only,
+	 * gated D3D9SW_HEAPCENSUS. */
+	gameheap_heap_census();
+	/* The free-space histogram beside the census: what the game and our own
+	 * reservations leave unclaimed, and where the big holes sit. Run across
+	 * sessions it says which holes are deterministic enough to plant an aperture
+	 * in. Gated D3D9SW_FREEMAP. */
+	freemap_report();
 	/* Before suspend_all, because the point is to have nothing playing for the
 	 * whole window rather than merely for the copy. */
 	dsh_quiet();
@@ -12942,6 +13555,11 @@ static int do_save(int slotno)
 		}
 		addr = next;
 	}
+
+	/* Ownership breakdown of what was just chosen versus left behind, and the
+	 * direct read of who actually holds 0x20000000. Still inside the suspended
+	 * window, reads only. */
+	save_attribution(s);
 
 	/* Ceiling above 2 GB means the large-address-aware flag took effect. The
 	 * largest free block is what any future allocation arena has to fit in. */
@@ -13158,6 +13776,14 @@ static int do_save(int slotno)
 			continue;
 		}
 		t->tid = g_ctl->ids[i];
+		{
+			/* The stack range, for a cross-session restore to relocate this
+			 * thread's saved SP and stack pointers when it adopts the thread. */
+			unsigned char *teb = (unsigned char *)teb_of(g_ctl->handles[i]);
+
+			t->stack_base = teb ? *(const uintptr_t *)(teb + TIB_STACK_BASE) : 0;
+			t->stack_limit = teb ? *(const uintptr_t *)(teb + TIB_STACK_LIMIT) : 0;
+		}
 		/* Where a thread is parked says whether the un-restorable sync
 		 * state matters: an instruction pointer inside a system module
 		 * means it is sitting in a wait we cannot reproduce.
@@ -13275,6 +13901,36 @@ static int do_save(int slotno)
 		s->mod_lo[i] = g_ctl->mod_lo[i];
 		s->mod_hi[i] = g_ctl->mod_hi[i];
 		memcpy(s->mod_name[i], g_ctl->mod_name[i], sizeof(s->mod_name[i]));
+	}
+	/* The non-module owned-heap anchors (arena, LAA region). With the modules
+	 * above, this is the base set a cross-session restore relocates against. */
+	s->nanchor = gameheap_anchor_ranges(s->anchor_base, s->anchor_size,
+					    (int)(sizeof(s->anchor_base) /
+						  sizeof(s->anchor_base[0])));
+	for (i = 0; i < s->nanchor; i++)
+		ss_log("  anchor: owned heap %d at %08lX, %lu KB - recorded for a "
+		       "relocatable restore\n",
+		       i, (unsigned long)s->anchor_base[i],
+		       (unsigned long)(s->anchor_size[i] >> 10));
+	{
+		/* The per-thread stack anchors, recorded above in the thread loop. The
+		 * requesting thread is the one a cross-session restore would adopt, so
+		 * name its stack for visibility. */
+		int j, with_stack = 0;
+		uintptr_t rb = 0, rl = 0;
+
+		for (j = 0; j < s->nthreads; j++) {
+			if (s->threads[j].stack_base)
+				with_stack++;
+			if (s->threads[j].tid == g_ctl->req_tid) {
+				rb = s->threads[j].stack_base;
+				rl = s->threads[j].stack_limit;
+			}
+		}
+		ss_log("  anchor: %d of %d thread stack(s) recorded; requesting thread %u "
+		       "stack %08lX..%08lX - the thread a cross-session restore adopts\n",
+		       with_stack, s->nthreads, (unsigned)g_ctl->req_tid,
+		       (unsigned long)rl, (unsigned long)rb);
 	}
 	time_now(&s->clock);
 	s->nevents = events_capture(s->events, SS_MAX_EVENTS);
@@ -14716,13 +15372,153 @@ static void clobber_tick(void)
 		clobber_check();
 }
 
+/* -------------------------------------------------- relocatable restore (Option B)
+ *
+ * Cross-session, a saved snapshot's absolute addresses are wrong wherever the
+ * thing they point at loaded elsewhere this run - the exe most of all (ASLR).
+ * Each saved anchor (module by name, arena by range) carries its save-time base;
+ * here we find its NEW base and shift every pointer-shaped word in the restored
+ * memory that falls in a MOVED range by that range's delta. The arena is pinned
+ * at a fixed base so its delta is zero and it needs nothing. Heuristic - a
+ * non-pointer word that happens to land in a moved range is shifted too - but the
+ * surface is tiny (essentially the exe) so the collateral is in dead data, which
+ * the cross-session bar accepts. Off unless D3D9SW_RELOC=1, so the in-session
+ * path, where no base moved, is untouched. This is the memory-content half; the
+ * adopted thread's SP and context come with the adoption piece. */
+typedef struct {
+	uintptr_t lo, hi;
+	intptr_t delta;
+} RelocEnt;
+
+static int reloc_build(const Slot *s, RelocEnt *map, int max)
+{
+	int i, n = 0;
+
+	for (i = 0; i < s->nmods && n < max; i++) {
+		HMODULE m = GetModuleHandleA(s->mod_name[i]);
+		uintptr_t now;
+		intptr_t d;
+
+		if (!m)
+			continue; /* module absent this session - accept-death */
+		now = (uintptr_t)m;
+		d = (intptr_t)(now - s->mod_lo[i]);
+		if (!d)
+			continue; /* same base came back - nothing to shift */
+		map[n].lo = s->mod_lo[i];
+		map[n].hi = s->mod_hi[i];
+		map[n].delta = d;
+		ss_log("  reloc: %-20s was %08lX now %08lX, delta %+ld (%lu KB range)\n",
+		       s->mod_name[i], (unsigned long)s->mod_lo[i], (unsigned long)now,
+		       (long)d, (unsigned long)((s->mod_hi[i] - s->mod_lo[i]) >> 10));
+		n++;
+	}
+	return n;
+}
+
+static unsigned long reloc_scan(uintptr_t base, size_t size, const RelocEnt *map,
+				int n)
+{
+	uintptr_t end = base + size, a = base;
+	unsigned long shifted = 0;
+	MEMORY_BASIC_INFORMATION mbi;
+
+	/* Walk only what this process actually has committed under the saved
+	 * extent, run by run, rather than trusting the saved size and striding to
+	 * its end. A region can be back only in part: EXCLFORCE writes the pages
+	 * whose address is committed and leaves holes where it is not, and a region
+	 * that "belongs elsewhere" now begins inside a shorter live allocation. The
+	 * old scan checked one readable first word and then strode the whole size -
+	 * it faulted ~26 MB into a 32 MB region when the live allocation ended and
+	 * the next page was free. Each committed, writable run is scanned on its
+	 * own; free, reserved and no-access runs are stepped over, never read. */
+	while (a < end && VirtualQuery((LPCVOID)a, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+		uintptr_t run = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+		int usable = mbi.State == MEM_COMMIT &&
+			     !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+			     (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+					     PAGE_EXECUTE_READWRITE |
+					     PAGE_EXECUTE_WRITECOPY)) != 0;
+
+		if (run > end)
+			run = end;
+		if (run <= a)
+			break;
+		if (usable) {
+			uintptr_t *p = (uintptr_t *)a;
+			size_t words = (size_t)(run - a) / sizeof(uintptr_t), w;
+			int j;
+
+			for (w = 0; w < words; w++) {
+				uintptr_t val = p[w];
+
+				for (j = 0; j < n; j++)
+					if (val >= map[j].lo && val < map[j].hi) {
+						p[w] = (uintptr_t)((intptr_t)val +
+								   map[j].delta);
+						shifted++;
+						break;
+					}
+			}
+		}
+		a = run;
+	}
+	return shifted;
+}
+
+static void reloc_apply(const Slot *s)
+{
+	RelocEnt map[SS_MAX_MODS];
+	char v[8];
+	unsigned got = ss_getenv("D3D9SW_RELOC", v, sizeof(v));
+	unsigned long total = 0;
+	int n, i, scanned = 0;
+
+	if (!(got > 0 && got < sizeof(v) && v[0] == '1'))
+		return;
+	n = reloc_build(s, map, SS_MAX_MODS);
+	if (!n) {
+		ss_log("  reloc: no module base moved since the save - nothing to shift "
+		       "(same session, or the same bases came back)\n");
+		return;
+	}
+	/* Only writable data holds relocatable pointers; code is read-only and its
+	 * own fixups were done by the loader. Scan the regions we just restored. */
+	for (i = 0; i < s->nregs; i++) {
+		DWORD prot = s->regs[i].prot;
+		int writable = (prot & (PAGE_READWRITE | PAGE_WRITECOPY |
+					PAGE_EXECUTE_READWRITE |
+					PAGE_EXECUTE_WRITECOPY)) != 0;
+		MEMORY_BASIC_INFORMATION mbi;
+
+		if (!writable)
+			continue;
+		/* Only a region that came back as its own allocation holds the
+		 * snapshot's pointers. One that "belongs elsewhere" now is a
+		 * different live allocation at the same address - shifting words in
+		 * it that happen to fall in a module's range would corrupt a
+		 * stranger, not relocate our data - so it is left alone. The scan
+		 * itself is bounded to committed runs, but this keeps it off memory
+		 * that was never ours to walk in the first place. */
+		if (VirtualQuery((LPCVOID)s->regs[i].base, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+		    mbi.State != MEM_COMMIT ||
+		    (uintptr_t)mbi.AllocationBase != s->regs[i].alloc_base)
+			continue;
+		total += reloc_scan(s->regs[i].base, (size_t)s->regs[i].size, map, n);
+		scanned++;
+	}
+	ss_log("  reloc: %lu pointer(s) shifted across %d moved module(s), %d region(s) "
+	       "scanned - a cross-session restore relocated the snapshot\n",
+	       total, n, scanned);
+}
+
 static int do_load(int slotno)
 {
 	Slot *s = &g_ctl->slots[slotno];
 	Window w;
 	unsigned long long pos = 0;
 	int i, j, restored = 0, skipped = 0, tls_done = 0, blocked = 0;
-	int skipped_excl = 0;
+	int skipped_excl = 0, skipped_mapped = 0;
 	int handskip = 0, handscrib = 0;
 
 	/* Only when there is nothing in memory, so a session that took its own save
@@ -14738,6 +15534,17 @@ static int do_load(int slotno)
 	 * this line then the comparison after the restore has nothing to miss, and
 	 * the check reports health exactly as it did before it was written. */
 	heap_check("as the restore begins");
+	/* Make the shared active witness THIS slot's, so room_check and the restore
+	 * verification compare against the world this save was taken in rather than
+	 * whatever was saved most recently into another slot. Every g_ctl->wit_*
+	 * reader downstream then sees the right save without being touched. */
+	if (s->wit_valid) {
+		g_ctl->wit_ent = s->wit_ent;
+		g_ctl->wit_x = s->wit_x;
+		g_ctl->wit_y = s->wit_y;
+		g_ctl->wit_map = s->wit_map;
+		g_ctl->wit_valid = 1;
+	}
 	/* Before anything moves, so a refusal costs nothing at all. */
 	if (!room_check())
 		return 0;
@@ -14971,6 +15778,22 @@ static int do_load(int slotno)
 		 * the same address. */
 		if (VirtualQuery((LPCVOID)base, &mbi, sizeof(mbi)) == sizeof(mbi) &&
 		    mbi.State == MEM_COMMIT) {
+			/* A live file mapping cannot take the saved private bytes - a write
+			 * into a section view goes to the file or faults, it is not a memcpy
+			 * target - so there is nothing to force and no choice to refuse over.
+			 * The game re-mapped an asset here in this session; it will read from
+			 * the mapping, not from the private data we saved. Hold it out like a
+			 * regenerable region and let the load go ahead. This is the bulk of
+			 * the cross-session "belongs elsewhere" set: private at save, mapped
+			 * now. D3D9SW_MAPSKIP=0 goes back to counting it as unrestorable. */
+			if (mbi.Type == MEM_MAPPED && mapskip_mode()) {
+				ss_log("  region %p+%lx is a live file mapping now (was type "
+				       "%lx) - the game re-maps it, held out\n",
+				       (void *)base, (unsigned long)size,
+				       (unsigned long)s->regs[i].type);
+				skipped_mapped++;
+				continue;
+			}
 			if (mbi.Type != s->regs[i].type ||
 			    (uintptr_t)mbi.AllocationBase != s->regs[i].alloc_base) {
 				ss_log("  region %p+%lx now belongs elsewhere: "
@@ -15154,10 +15977,25 @@ static int do_load(int slotno)
 			       "at the save. The restore goes ahead without them\n",
 			       skipped_excl);
 	}
+	if (skipped_mapped)
+		ss_log("  %d region(s) held out - private at the save, a live file mapping "
+		       "now; the game re-maps them, so the restore goes ahead without "
+		       "them\n",
+		       skipped_mapped);
 	if (skipped) {
-		ss_log("load: refused, %d of %d regions unrestorable\n", skipped, s->nregs);
-		resume_all(0);
-		return 0;
+		if (exclforce_mode()) {
+			ss_log("  EXCLFORCE: %d of %d region(s) are unrestorable (belong "
+			       "elsewhere now, or will not recommit) - NOT refusing; each is "
+			       "written where its address is committed and left in the present "
+			       "where it is not. The whole snapshot goes in over the live "
+			       "process; expect it to cry\n",
+			       skipped, s->nregs);
+		} else {
+			ss_log("load: refused, %d of %d regions unrestorable\n", skipped,
+			       s->nregs);
+			resume_all(0);
+			return 0;
+		}
 	}
 
 	memset(&w, 0, sizeof(w));
@@ -15278,6 +16116,24 @@ static int do_load(int slotno)
 			DWORD old;
 			int writable;
 
+			/* Never the stack this restore is running on. A saved game region
+			 * can land on the helper stack in a fresh session, and painting the
+			 * snapshot over the frame executing this loop is not a cry, it is an
+			 * instant death that reports nothing. The refuse used to keep us from
+			 * ever reaching here with such a region; EXCLFORCE removes the refuse,
+			 * so the guard has to be explicit. Correct in every mode - a region
+			 * that IS the running stack was never restorable. */
+			if (g_ctl && (uintptr_t)base + (uintptr_t)size > g_ctl->helper_lo &&
+			    (uintptr_t)base < g_ctl->helper_hi) {
+				ss_log("  region %d at %p left untouched, %llu bytes - it is the "
+				       "restore thread's own live stack now\n",
+				       i, base, (unsigned long long)size);
+				if (g_reg_off)
+					g_reg_off[i] = pos;
+				pos += size;
+				continue;
+			}
+
 			/* Before the protect. A SIGUSR1 from this call reloads eax from
 			 * the frame, so the saved status has to already be 0, and the
 			 * frame's own region is not protected or written at all. */
@@ -15391,6 +16247,13 @@ static int do_load(int slotno)
 						g_clob_ok[i] = 1;
 				} else
 					skipped++;
+			} else if (!writable && exclforce_mode()) {
+				/* Force mode reaches the write phase with regions the
+				 * refuse would normally have stopped. One that will not
+				 * turn writable is uncommitted or otherwise untouchable;
+				 * writing it would fault rather than cry, so leave it in
+				 * the present instead of painting into a hole. */
+				skipped++;
 			} else if (win_copy_except_live(&w, pos, base, size)) {
 				restored++;
 				/* Only regions we actually wrote are worth asking
@@ -15867,7 +16730,41 @@ static int do_load(int slotno)
 		ss_log("  files: %d handle(s) seeked back\n", seeked);
 	}
 
-	{
+	/* Before touching contexts, measure whether the saved stack addresses are
+	 * free here - the one fact that decides if cross-session thread adoption is
+	 * possible at all. Reads only; it changes nothing. */
+	stackprobe_report(s);
+
+	if (dataonly_mode()) {
+		/* No context is wound back. Every thread - the requesting one included -
+		 * keeps its current execution and reads the rewound world, the way a
+		 * cross-session restore already must and the way thread_harness showed
+		 * works. The requesting thread therefore returns from savestate_load
+		 * normally rather than resuming inside savestate_save. TLS is still put
+		 * back, since it is data the running thread reads, not execution state. */
+		int tls_only = 0;
+
+		for (i = 0; i < s->nthreads; i++)
+			for (j = 0; j < g_ctl->nids; j++)
+				if (g_ctl->ids[j] == s->threads[i].tid && g_ctl->handles[j]) {
+					if (s->threads[i].have_tls) {
+						unsigned char *teb = (unsigned char *)teb_of(
+							g_ctl->handles[j]);
+						if (teb) {
+							memcpy(teb + TEB_TLS_SLOTS,
+							       s->threads[i].tls,
+							       sizeof(s->threads[i].tls));
+							tls_only++;
+						}
+					}
+					break;
+				}
+		tls_done = tls_only;
+		ss_log("  DATAONLY: thread contexts NOT applied - the runners keep their "
+		       "current execution and read the rewound world (%d TLS block(s) put "
+		       "back)\n",
+		       tls_only);
+	} else {
 	int ctx_set = 0, ctx_refused = 0, ctx_bad = 0;
 	unsigned ctx_field_bad[SS_NCTXF];
 
@@ -15975,6 +16872,7 @@ static int do_load(int slotno)
 	 * pre-restore value by the second restore and re-anchor itself. */
 	if (!g_ctl->anchor_tick)
 		g_ctl->anchor_tick = GetTickCount();
+	g_ctl->load_tick = GetTickCount();
 	ss_log("  threads: %d context(s) restored, %d with TLS\n", s->nthreads, tls_done);
 	/* Reported from the helper, not from savestate_load.
 	 *
@@ -15987,6 +16885,10 @@ static int do_load(int slotno)
 	 * the only thread that survives the restore in its own present. */
 	roster_load();
 	carry_load();
+	/* Cross-session only (D3D9SW_RELOC=1): shift the restored snapshot's pointers
+	 * from their save-time module bases to this run's. In-session it is a no-op -
+	 * no base moved. Before witness_load so the relocated world is what it reads. */
+	reloc_apply(s);
 	witness_load();
 	if (g_ctl->diff_same || g_ctl->diff_wrote) {
 		unsigned long long tot = g_ctl->diff_same + g_ctl->diff_wrote;
@@ -16206,8 +17108,15 @@ static DWORD WINAPI helper_main(LPVOID param)
 		while ((req = InterlockedExchange(&g_ctl->request, REQ_NONE)) == REQ_NONE)
 			YieldProcessor();
 		QueryPerformanceCounter(&h0);
+		/* Held from the first checkpoint (early, while the address space still
+		 * has a 64 MB hole) and released just for this operation so the views
+		 * land in a guaranteed contiguous span, then re-held. This is Phase 1:
+		 * save slots bounded by disk, not by finding a hole at restore time. */
+		bank_reserve_init();
+		bank_release();
 		g_ctl->result = (req == REQ_SAVE) ? do_save((int)g_ctl->slot)
 						  : do_load((int)g_ctl->slot);
+		bank_reacquire();
 		QueryPerformanceCounter(&h1);
 		QueryPerformanceFrequency(&hf);
 		/* This thread is not in the snapshot, so its clock readings survive a
@@ -16697,7 +17606,14 @@ static void guard_body(void)
 		if (!g_ctl->guard)
 			return;
 	}
-	s = &g_ctl->slots[0];
+	{
+		/* The slot in play, not always slot 0, now that more than one can be
+		 * held - the old hardcode would guard slot 0 while another was active. */
+		int gs = ((int)g_ctl->slot >= 0 && (int)g_ctl->slot < SAVESTATE_SLOTS)
+				 ? (int)g_ctl->slot
+				 : 0;
+		s = &g_ctl->slots[gs];
+	}
 	if (!s->valid || g_ctl->guard_bytes >= SS_GUARD_CAP)
 		return;
 
@@ -16892,6 +17808,46 @@ static int rr_entity(uintptr_t *ent, unsigned *mapid)
 	return 1;
 }
 
+/* The seam between a restored world and the game's live machinery.
+ *
+ * After a restore, does the entity-table root at image+RR_ENTITY_PTR point back
+ * at the entity the save recorded, or did the machinery fail to reconstitute? A
+ * within-map or last-save restore comes back with the root aimed at the witness
+ * entity - the world is coherent. A cross-map restore of a non-primary save comes
+ * back with the root null, unmapped, or aimed at a DIFFERENT entity, because we
+ * swapped the owned region but not the machinery that rebuilds it - and that root
+ * (plus whatever it walks into, and the terrain) is exactly what a wider bank has
+ * to carry. Read-only; logged on every restore so the two cases sit side by side. */
+static void rr_seam_dump(void)
+{
+	HMODULE exe = GetModuleHandleA(NULL);
+	uintptr_t base = (uintptr_t)exe;
+	uintptr_t root = 0;
+	unsigned map = 0xFFFFFFFFu;
+	const char *state;
+
+	if (!g_ctl || !savestate_host_is("rabiribi.exe"))
+		return;
+	if (ss_readable(base + RR_ENTITY_PTR, sizeof(uintptr_t)))
+		root = *(const uintptr_t *)(base + RR_ENTITY_PTR);
+	if (ss_readable(base + RR_MAPID, sizeof(unsigned)))
+		map = *(const unsigned *)(base + RR_MAPID);
+	if (!root)
+		state = "NULL - the machinery did not rebuild the player (world not "
+			"reconstituted)";
+	else if (!ss_readable(root + RR_Y_OFF, sizeof(float)))
+		state = "unmapped - the root points at nothing committed";
+	else if (g_ctl->wit_valid && root == g_ctl->wit_ent)
+		state = "MATCHES the witness entity - the world came back coherent";
+	else
+		state = "readable but NOT the witness entity - a different world "
+			"reconstituted at this root";
+	ss_log("  seam: entity-root image+%lX = %08lX, live mapid %lu; save was map "
+	       "%u, entity %08lX - %s\n",
+	       (unsigned long)RR_ENTITY_PTR, (unsigned long)root, (unsigned long)map,
+	       g_ctl->wit_map, (unsigned long)g_ctl->wit_ent, state);
+}
+
 /* How much of the entity travels. Eight bytes is x and y alone, which is
  * measured to work room to room inside one world. Widening it is how we find
  * out what else is worth carrying without guessing which fields matter: set a
@@ -16905,7 +17861,13 @@ static int pos_span(void)
 		DWORD n = ss_getenv("D3D9SW_POS_SPAN", v, sizeof(v));
 
 		cached = (n > 0 && n < sizeof(v)) ? atoi(v) : 8;
-		if (cached < 8)
+		/* 0 turns the force OFF entirely - the wholesale restore now places the
+		 * player on its own, and the force's single shared mark was clobbering
+		 * every restore with the LAST save's position (the "last slot prevails"
+		 * bug). Any other value is at least x and y (8 bytes). */
+		if (cached < 0)
+			cached = 0;
+		else if (cached > 0 && cached < 8)
 			cached = 8;
 		if (cached > (int)sizeof(g_ctl->pos_buf))
 			cached = (int)sizeof(g_ctl->pos_buf);
@@ -17243,6 +18205,14 @@ static void witness_save(Slot *s)
 	g_ctl->wit_y = *(const float *)(ent + RR_Y_OFF);
 	g_ctl->wit_map = map;
 	g_ctl->wit_valid = 1;
+	/* Snapshot into the slot, so restoring THIS save later checks against the
+	 * world it was taken in even after another slot has overwritten the shared
+	 * active witness. */
+	s->wit_ent = g_ctl->wit_ent;
+	s->wit_x = g_ctl->wit_x;
+	s->wit_y = g_ctl->wit_y;
+	s->wit_map = g_ctl->wit_map;
+	s->wit_valid = 1;
 	ss_log("  witness: player at x=%d y=%d, entity %08lX, world %u - %s\n",
 	       (int)g_ctl->wit_x, (int)g_ctl->wit_y, (unsigned long)ent, map,
 	       in_save ? "INSIDE a captured region"
@@ -17538,6 +18508,9 @@ static void witness_load(void)
 	unsigned map = 0;
 	float x, y;
 
+	/* Before the early return, so the FAILING case - the one where the root did
+	 * not reconstitute and rr_entity bails - is the one that gets logged. */
+	rr_seam_dump();
 	if (!g_ctl || !g_ctl->wit_valid || !rr_entity(&ent, &map))
 		return;
 	x = *(const float *)(ent + RR_X_OFF);
@@ -17718,6 +18691,11 @@ static int vk_parse(const char *s, int n, int def)
 }
 
 static int g_vk_save, g_vk_load;
+/* D3D9SW_SLOT_VK: one base key for interleaved save/load PAIRS - slot k saves on
+ * base+2k and loads on base+2k+1. Base '1' (0x31) gives 1=save0 2=load0 3=save1
+ * 4=load1 5=save2 6=load2 7=save3 8=load3: number-row, no modifier, save and load
+ * for a slot side by side. Overrides the separate-range SAVE_VK/LOAD_VK scheme. */
+static int g_vk_pair;
 
 /* Resolved once and never re-read. A binding that changed mid-session would
  * mean the key that saved a slot is not the key that restores it, and the log
@@ -17735,6 +18713,8 @@ static void hotkeys_resolve(void)
 		g_vk_save = vk_parse(v, (n < sizeof(v)) ? (int)n : 0, VK_F5);
 		n = ss_getenv("D3D9SW_LOAD_VK", v, sizeof(v));
 		g_vk_load = vk_parse(v, (n < sizeof(v)) ? (int)n : 0, 0);
+		n = ss_getenv("D3D9SW_SLOT_VK", v, sizeof(v));
+		g_vk_pair = vk_parse(v, (n < sizeof(v)) ? (int)n : 0, 0);
 	}
 	/* Deferred rather than printed above, because this runs every frame from
 	 * the first one and the log does not exist until the control block does.
@@ -17742,8 +18722,15 @@ static void hotkeys_resolve(void)
 	 * session whether or not anything ever asked for a save. */
 	if (!said && g_ctl) {
 		said = 1;
-		if (g_vk_load) {
-			ss_log("hotkeys: save on %#x, load on %#x - separate keys, so "
+		if (g_vk_pair) {
+			ss_log("hotkeys: interleaved pairs from base 0x%x - slot k saves on "
+			       "base+2k, loads on base+2k+1: 0x%x/0x%x = save/load slot 0, "
+			       "0x%x/0x%x = slot 1. Number row, no modifier. Uses %d key(s) "
+			       "above the base for %d slot(s)\n",
+			       g_vk_pair, g_vk_pair, g_vk_pair + 1, g_vk_pair + 2,
+			       g_vk_pair + 3, 2 * SAVESTATE_SLOTS, SAVESTATE_SLOTS);
+		} else if (g_vk_load) {
+			ss_log("hotkeys: save on 0x%x, load on 0x%x - separate keys, so "
 			       "no modifier has to be held across a second press\n",
 			       g_vk_save, g_vk_load);
 			/* Each base covers SAVESTATE_SLOTS consecutive keys, so two
@@ -17767,7 +18754,7 @@ static void hotkeys_resolve(void)
 					       SAVESTATE_SLOTS);
 			}
 		} else {
-			ss_log("hotkeys: save on %#x, load on shift+%#x. Set "
+			ss_log("hotkeys: save on 0x%x, load on shift+0x%x. Set "
 			       "D3D9SW_LOAD_VK to give load a key of its own, which is "
 			       "what an automated run needs\n",
 			       g_vk_save, g_vk_save);
@@ -17780,6 +18767,22 @@ int savestate_hotkey(int slot)
 	hotkeys_resolve();
 	if (slot < 0 || slot >= SAVESTATE_SLOTS)
 		return SS_HOTKEY_NONE;
+	/* Interleaved pairs: slot k saves on base+2k, loads on base+2k+1. Two
+	 * different keys per slot, so order does not matter and no modifier is
+	 * involved - 1/2 for slot 0, 3/4 for slot 1, straight up the number row. */
+	if (g_vk_pair) {
+		if (savestate_key_edge(g_vk_pair + 2 * slot)) {
+			ss_log("hotkey: key 0x%x -> SAVE slot %d\n",
+			       g_vk_pair + 2 * slot, slot);
+			return SS_HOTKEY_SAVE;
+		}
+		if (savestate_key_edge(g_vk_pair + 2 * slot + 1)) {
+			ss_log("hotkey: key 0x%x -> LOAD slot %d\n",
+			       g_vk_pair + 2 * slot + 1, slot);
+			return SS_HOTKEY_LOAD;
+		}
+		return SS_HOTKEY_NONE;
+	}
 	/* Load first. With separate keys the two are different keys and the order
 	 * cannot matter; with one key and a modifier it would, and checking load
 	 * first keeps the two paths reading the same way. */
@@ -18130,6 +19133,8 @@ void savestate_pos_mark(void)
 	if (!pos_ready())
 		return;
 	span = pos_span();
+	if (span == 0)
+		return; /* force disabled (D3D9SW_POS_SPAN=0) */
 	if (!rr_entity(&ent, &map)) {
 		ss_log("pos: nothing to mark - no player entity yet\n");
 		return;
@@ -18158,6 +19163,8 @@ void savestate_pos_restore(void)
 
 	if (!pos_ready())
 		return;
+	if (pos_span() == 0)
+		return; /* force disabled - the wholesale restore stands on its own */
 	if (!g_ctl->pos_valid) {
 		ss_log("pos: nothing marked yet\n");
 		return;

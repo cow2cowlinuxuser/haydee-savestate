@@ -133,6 +133,19 @@ struct Sw11Res {
 	int is_bb;
 	int has_texels;
 	int warned_empty;
+	/* Capped by the resident-budget sweep (D3D11SW_RESIDENT_CAP_MB): the full
+	 * description is kept but no pixels are allocated, so it costs zero resident
+	 * bytes, renders as a magenta placeholder, and never crashes. This is exactly
+	 * the faucet's evicted state - a header whose content is not resident. */
+	int phantom;
+	/* Faucet (D3D11SW_FAUCET): the authoritative copy of this texture's content,
+	 * on the CRT heap (a disk file later). While the texture is resident its
+	 * pixels live in the arena; evicting frees the arena copy and leaves the bank,
+	 * so it can be painted back into a fresh arena slot when next drawn. The game's
+	 * handle never changes - only the payload behind it moves. */
+	unsigned char *bank;
+	UINT bank_size;
+	unsigned lru; /* draw-clock stamp of last use, for least-recently-used evict */
 	int id;
 	/* Retired rather than freed, so the game can still name it. Distinct from a
 	 * NULL pixels pointer, which also means an ordinary untextured draw. */
@@ -735,7 +748,10 @@ static struct {
 
 static void arena_init(void)
 {
-	static const uintptr_t bases[] = { 0x20000000u, 0x30000000u, 0x40000000u };
+	/* 0x20000000 is now the gameheap arena's fixed base (deterministic, cross-
+	 * session critical), so this texture arena tries the others first and only
+	 * falls to 0x20000000 last, if the gameheap pin did not take it. */
+	static const uintptr_t bases[] = { 0x40000000u, 0x30000000u, 0x20000000u };
 	char buf[32];
 	unsigned n = savestate_getenv("D3D11SW_ARENA_MB", buf, sizeof(buf));
 	unsigned long mb = n ? strtoul(buf, NULL, 10) : 0;
@@ -864,8 +880,134 @@ static void arena_free(void *p)
 	LeaveCriticalSection(&g_arena.cs);
 }
 
-static void *payload_alloc(size_t n)
+/* Kill the non-deterministic fallback (D3D9SW_NOFALLBACK=1). A payload that does
+ * not fit the pinned arena normally falls to a NULL-base VirtualAlloc, which the
+ * OS places at a different address every launch - and a cross-session restore
+ * cannot keep the game's cached pointer into it valid, which is the rabiribi+33803
+ * fault. This knob refuses that fallback instead: the payload fails to allocate
+ * (callers all handle NULL), so we can watch how load-bearing those payloads are.
+ * If the game shrugs, forcing everything through the arena is the fix; if it
+ * screams, the log says exactly how much and how big was refused. */
+static int nofallback(void)
 {
+	static int cached = -1;
+
+	if (cached < 0) {
+		char v[8];
+		unsigned n = savestate_getenv("D3D9SW_NOFALLBACK", v, sizeof(v));
+
+		cached = (n > 0 && n < sizeof(v) && v[0] == '1') ? 1 : 0;
+	}
+	return cached;
+}
+
+/* What a payload is FOR, so the resident cap starves only the set a bank-swap
+ * window would actually hold - the game's own shader-resource textures - and
+ * never our presenter. Denying a render-target/depth/backbuffer plane blacks the
+ * output; denying a reclaim drops a write (the missing-text path); neither is the
+ * game failing, and reading either as "the game stopped" would make the sweep
+ * measure us. Only PL_TEXTURE, and only when it is a pure shader resource, is
+ * cappable. */
+enum pl_tag { PL_TEXTURE, PL_BUFFER, PL_PIXELS, PL_DEPTH, PL_RECLAIM };
+
+/* Resident-budget stress cap (D3D11SW_RESIDENT_CAP_MB, 0 = off). Once live payload
+ * bytes reach the cap, deny NEW game shader-resource textures (the clean
+ * E_OUTOFMEMORY the game already survives) - and nothing of ours. Sweeping the cap
+ * down finds where the game goes from "renders wrong but playable" to "actually
+ * stops working": its minimum viable texture working set, the hard floor for how
+ * small a bank-swap resident window can be. Re-read every second so the cap can be
+ * walked down within a single launch, if the value's source updates live. */
+static unsigned resident_cap_mb(void)
+{
+	static volatile LONG cached = -1;
+	static volatile LONG last_ms;
+	DWORD now = GetTickCount();
+
+	if (cached < 0 || (LONG)(now - (DWORD)last_ms) > 1000) {
+		char v[16];
+		unsigned n = savestate_getenv("D3D11SW_RESIDENT_CAP_MB", v, sizeof(v));
+
+		cached = (n > 0 && n < sizeof(v)) ? (LONG)strtoul(v, NULL, 10) : 0;
+		last_ms = (LONG)now;
+	}
+	return (unsigned)(cached > 0 ? cached : 0);
+}
+
+/* True only for a game texture we would hold in a bank-swap window: a shader
+ * resource that is not also a render target and not a staging (readback) surface. */
+static int pl_cappable(const Sw11Res *r, int tag)
+{
+	return tag == PL_TEXTURE && r &&
+	       (r->bind & D3D11_BIND_SHADER_RESOURCE) &&
+	       !(r->bind & D3D11_BIND_RENDER_TARGET) &&
+	       r->usage != D3D11_USAGE_STAGING;
+}
+
+/* True when a fresh game texture would put live payload over the cap, so
+ * CreateTexture2D should build a phantom instead of allocating it. Since a phantom
+ * accounts zero bytes, once the budget is reached every further cappable texture
+ * becomes a phantom and g_res_bytes holds at the cap. */
+static int phantom_capped(const Sw11Res *r)
+{
+	unsigned cap = resident_cap_mb();
+
+	return cap && pl_cappable(r, PL_TEXTURE) &&
+	       (LONG64)g_res_bytes >= (LONG64)cap * 1024 * 1024;
+}
+
+/* A shared magenta placeholder sampled in place of a phantom's absent pixels. The
+ * phantom keeps its real description, but at the draw site we bind THIS at 16x16
+ * with clamp addressing, so the sampler can never read past it whatever the
+ * texture's real dimensions were - the trap the 1x1-with-a-faked-size idea would
+ * have sprung (an upload or Map sized for the real dimensions into a tiny buffer).
+ */
+#define PHANTOM_DIM 16
+static uint32_t g_phantom_px[PHANTOM_DIM * PHANTOM_DIM];
+/* One scratch buffer, grown to the largest phantom ever mapped, so a Map of a
+ * phantom hands back a correctly-sized target instead of NULL. Writes through it
+ * are thrown away on Unmap. */
+static unsigned char *g_phantom_scratch;
+static size_t g_phantom_scratch_sz;
+static CRITICAL_SECTION g_phantom_cs;
+static int g_phantom_ready;
+
+static void phantom_init(void)
+{
+	int i;
+
+	if (g_phantom_ready)
+		return;
+	for (i = 0; i < PHANTOM_DIM * PHANTOM_DIM; i++)
+		g_phantom_px[i] = 0xFFFF00FFu; /* opaque magenta */
+	InitializeCriticalSection(&g_phantom_cs);
+	g_phantom_ready = 1;
+}
+
+static unsigned char *phantom_scratch(size_t n)
+{
+	unsigned char *p = NULL;
+
+	if (!g_phantom_ready)
+		phantom_init();
+	EnterCriticalSection(&g_phantom_cs);
+	if (n > g_phantom_scratch_sz) {
+		unsigned char *q = (unsigned char *)realloc(g_phantom_scratch, n);
+
+		if (q) {
+			g_phantom_scratch = q;
+			g_phantom_scratch_sz = n;
+		}
+	}
+	if (g_phantom_scratch_sz >= n)
+		p = g_phantom_scratch;
+	LeaveCriticalSection(&g_phantom_cs);
+	return p;
+}
+
+static void *payload_alloc(size_t n, const Sw11Res *r, int tag)
+{
+	(void)r;
+	(void)tag; /* the cap decision now lives in CreateTexture2D as a phantom */
 	if (!n)
 		n = 4;
 	if (n >= PAYLOAD_VA_MIN) {
@@ -877,6 +1019,12 @@ static void *payload_alloc(size_t n)
 		 * textures created after a save are not reclaimed on restore. */
 		if (p)
 			return p;
+		if (nofallback()) {
+			d11_log("NOFALLBACK: arena full, REFUSING a %lu KB payload rather "
+				"than placing it at a non-deterministic base",
+				(unsigned long)(n >> 10));
+			return NULL;
+		}
 		p = VirtualAlloc(NULL, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 		if (p)
 			ledger_add(p, n);
@@ -975,6 +1123,7 @@ static struct ledger *ledger_get(void)
  * handler once the savestate engine has installed its own. */
 static int heal_cap(void);
 static LONG CALLBACK d11_veh(EXCEPTION_POINTERS *ep);
+static void mapprobe_summary(void);
 static PVOID g_veh_tok;
 
 void xa2_sw_trace_dump(void (*emit)(const char *));
@@ -1058,6 +1207,9 @@ static void ledger_register(void)
 			"engine's handler",
 			heal_cap());
 	}
+	/* A tally beside every save: how the game reaches payloads (handle vs raw
+	 * pointer), the number the whole aperture plan turns on. */
+	mapprobe_summary();
 }
 
 static void ledger_lock(struct ledger *l)
@@ -1610,6 +1762,203 @@ static void map_track(const unsigned char *p, size_t bytes, int id, int bind, in
 	g_map_track[i].kind = kind;
 }
 
+/* ---- guard-page-on-Unmap probe (D3D9SW_MAPPROBE=1) -------------------------
+ *
+ * The hinge for the whole bank-swap/aperture plan: does the game reach a payload
+ * only through our API (BY HANDLE - then the payload can float freely through a
+ * resident window) or does it cache the Map pointer and dereference the payload
+ * while it is UNMAPPED (BY RAW POINTER - then that payload needs a stable address
+ * or a fault-in)? This measures it directly. On Unmap we arm the payload's pages
+ * with PAGE_GUARD; on Map we disarm (a mapped access is legitimate, not the
+ * signal). A guard fault therefore means an access to the payload WHILE UNMAPPED,
+ * and the faulting instruction's module says who: our own raster reading a
+ * texture to draw it (expected, uninteresting) vs the game touching a pointer it
+ * kept (the raw-pointer case that crashed cross-session at rabiribi+33803). Once
+ * an entry is confirmed as raster we stop re-arming it, so a per-frame dynamic
+ * texture does not flood; a resource the game raw-touches is what we are hunting.
+ * PAGE_GUARD is one-shot (auto-clears on trigger), so the faulting access simply
+ * re-runs on a normal page - the probe reads only, it never changes behaviour.
+ * Page-aligned payloads >=64 KB only (the VirtualAlloc/arena ones; small calloc
+ * blocks share pages and cannot be guarded without hitting neighbours). */
+#define MAPPROBE_MAX 2048
+static struct mp_ent {
+	uintptr_t base;
+	SIZE_T size;
+	int id, kind;
+	volatile LONG armed; /* 1 = guard set and not yet fired */
+	volatile LONG cls;   /* 0 unknown, 1 raster (ours), 2 game/other */
+} g_mp[MAPPROBE_MAX];
+static volatile LONG g_mp_n;
+static volatile LONG g_mp_arms, g_mp_game, g_mp_raster, g_mp_other, g_mp_remap;
+static HMODULE g_mp_self;
+static volatile LONG g_mp_veh_on;
+/* Map census (no guard pages): every Map counted by size and access, so we can
+ * SEE whether the game is ever handed a pointer into a big payload at all. If
+ * big maps are ~0, the big textures are immutable/handle-only and float freely -
+ * the guard-page arms being 0 is then a positive result, not a miss. */
+static volatile LONG g_mc_calls, g_mc_read, g_mc_big, g_mc_bigread, g_mc_aligned;
+
+static int mapprobe_on(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		char v[8];
+		unsigned n = savestate_getenv("D3D9SW_MAPPROBE", v, sizeof(v));
+
+		cached = (n > 0 && n < sizeof(v) && v[0] == '1') ? 1 : 0;
+	}
+	return cached;
+}
+
+static struct mp_ent *mp_find(uintptr_t base)
+{
+	LONG i, n = g_mp_n;
+
+	for (i = 0; i < n; i++)
+		if (g_mp[i].base == base)
+			return &g_mp[i];
+	return NULL;
+}
+
+static LONG CALLBACK mapprobe_veh(EXCEPTION_POINTERS *ep)
+{
+	const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+	ULONG_PTR at;
+	LONG i, n;
+
+	if (er->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION)
+		return EXCEPTION_CONTINUE_SEARCH;
+	at = er->NumberParameters >= 2 ? er->ExceptionInformation[1] : 0;
+	n = g_mp_n;
+	for (i = 0; i < n; i++) {
+		if (!g_mp[i].armed || at < g_mp[i].base ||
+		    at >= g_mp[i].base + g_mp[i].size)
+			continue;
+		{
+			void *pc = er->ExceptionAddress;
+			HMODULE mod = NULL;
+			int ours = 0, exe = 0;
+
+			if (GetModuleHandleExA(
+				    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+					    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				    (LPCSTR)pc, &mod)) {
+				ours = (mod == g_mp_self);
+				exe = (mod == GetModuleHandleA(NULL));
+			}
+			g_mp[i].armed = 0; /* PAGE_GUARD auto-cleared on this fault */
+			if (ours) {
+				g_mp[i].cls = 1;
+				InterlockedIncrement(&g_mp_raster);
+			} else {
+				g_mp[i].cls = 2;
+				if (exe) {
+					if (InterlockedIncrement(&g_mp_game) <= 16)
+						d11_log("MAPPROBE: GAME touched UNMAPPED "
+							"payload #%d (%s) at %p from "
+							"rabiribi.exe+%p - RAW-POINTER access",
+							g_mp[i].id,
+							g_mp[i].kind ? "texture" : "buffer",
+							(void *)at,
+							(void *)((char *)pc -
+								 (char *)GetModuleHandleA(NULL)));
+				} else {
+					InterlockedIncrement(&g_mp_other);
+				}
+			}
+		}
+		return EXCEPTION_CONTINUE_EXECUTION; /* re-run on the now-normal page */
+	}
+	return EXCEPTION_CONTINUE_SEARCH; /* not ours (e.g. a real stack guard page) */
+}
+
+static void mapprobe_clear(const Sw11Res *r)
+{
+	struct mp_ent *e;
+	uintptr_t base;
+	DWORD old;
+
+	if (!mapprobe_on() || !r || !r->cpu)
+		return;
+	base = (uintptr_t)r->cpu;
+	e = mp_find(base);
+	if (e && e->armed) {
+		/* Being legitimately re-mapped: drop the guard so the mapped access
+		 * does not count as a stale-pointer touch. A clean re-map with no
+		 * unmapped access in between is the handle-only pattern. */
+		VirtualProtect((void *)base, e->size, PAGE_READWRITE, &old);
+		e->armed = 0;
+		InterlockedIncrement(&g_mp_remap);
+	}
+}
+
+static void mapprobe_arm(const Sw11Res *r)
+{
+	struct mp_ent *e;
+	uintptr_t base;
+	DWORD old;
+	LONG i;
+
+	if (!mapprobe_on() || !r || !r->cpu)
+		return;
+	base = (uintptr_t)r->cpu;
+	if ((base & 0xFFF) || r->cpu_size < 0x10000)
+		return; /* page-aligned, >=64 KB payloads only */
+	if (!InterlockedCompareExchange(&g_mp_veh_on, 1, 0)) {
+		GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+					   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				   (LPCSTR)&mapprobe_arm, &g_mp_self);
+		AddVectoredExceptionHandler(1, mapprobe_veh);
+		d11_log("MAPPROBE: armed - guard-page on Unmap, classifying "
+			"unmapped-payload access as raster (ours) vs game (raw pointer)");
+	}
+	e = mp_find(base);
+	if (e && e->cls == 1)
+		return; /* confirmed raster reads this every draw - do not flood */
+	if (!e) {
+		i = InterlockedIncrement(&g_mp_n) - 1;
+		if (i >= MAPPROBE_MAX)
+			return;
+		e = &g_mp[i];
+		e->base = base;
+		e->cls = 0;
+	}
+	e->size = r->cpu_size;
+	e->id = r->id;
+	e->kind = r->kind;
+	if (VirtualProtect((void *)base, r->cpu_size, PAGE_READWRITE | PAGE_GUARD, &old)) {
+		e->armed = 1;
+		InterlockedIncrement(&g_mp_arms);
+	}
+}
+
+/* Logged from the savestate path (ledger_register), so a tally lands beside every
+ * save. game>0 proves raw-pointer access exists and how common; a high remap+
+ * (never-fired) share means most payloads are handle-only and can float. */
+static void mapprobe_summary(void)
+{
+	LONG i, n = g_mp_n, gcls = 0, rcls = 0, ucls = 0;
+
+	if (!mapprobe_on())
+		return;
+	for (i = 0; i < n; i++) {
+		if (g_mp[i].cls == 2) gcls++;
+		else if (g_mp[i].cls == 1) rcls++;
+		else ucls++;
+	}
+	d11_log("MAPPROBE census: %ld Map call(s) - %ld for READ, %ld big(>=128K), "
+		"%ld big+READ, %ld page-aligned. If big ~0 the big textures are never "
+		"mapped = handle-only = FLOATABLE",
+		(long)g_mc_calls, (long)g_mc_read, (long)g_mc_big, (long)g_mc_bigread,
+		(long)g_mc_aligned);
+	d11_log("MAPPROBE tally: %ld arm(s); accesses while UNMAPPED - game(raw) %ld, "
+		"raster(ours) %ld, other %ld; clean re-maps %ld. Distinct payloads: "
+		"%ld game-touched, %ld raster-only, %ld never-touched(floatable)",
+		(long)g_mp_arms, (long)g_mp_game, (long)g_mp_raster, (long)g_mp_other,
+		(long)g_mp_remap, gcls, rcls, ucls);
+}
+
 /* Module names for the fault handler, gathered in advance.
  *
  * The handler cannot ask the loader who owns an address. This crash proves why:
@@ -1931,7 +2280,8 @@ static int heal_fault(EXCEPTION_POINTERS *ep)
 
 				for (depth = 0; depth < 8 && fp; depth++) {
 					const ULONG_PTR *fr = (const ULONG_PTR *)fp;
-					ULONG_PTR ret, fb = 0;
+					ULONG_PTR ret;
+					uintptr_t fb = 0; /* mod_name wants uintptr_t* */
 					const unsigned char *c;
 					const char *fn;
 					char hex[80];
@@ -2188,7 +2538,8 @@ static LONG CALLBACK d11_veh(EXCEPTION_POINTERS *ep)
 
 				for (depth = 0; depth < 8 && fp; depth++) {
 					const ULONG_PTR *frame = (const ULONG_PTR *)fp;
-					ULONG_PTR ret, fb = 0;
+					ULONG_PTR ret;
+					uintptr_t fb = 0; /* mod_name wants uintptr_t* */
 					const char *fn;
 
 					if (IsBadReadPtr(frame, 2 * sizeof(*frame)))
@@ -3287,7 +3638,7 @@ static void res_reclaim_cpu(Sw11Res *r)
 	if (!r || r->kind != 1 || !r->gpu_released || r->cpu)
 		return;
 	want = fmt_size(r->format, r->width, r->height);
-	r->cpu = (unsigned char *)payload_alloc(want);
+	r->cpu = (unsigned char *)payload_alloc(want, r, PL_RECLAIM);
 	if (!r->cpu)
 		return;
 	r->cpu_size = (UINT)want;
@@ -4139,8 +4490,8 @@ static LONG64 res_payload_bytes(const Sw11Res *r)
 {
 	LONG64 n;
 
-	if (!r)
-		return 0;
+	if (!r || r->phantom)
+		return 0; /* a phantom holds no payload, so it accounts for nothing */
 	n = (LONG64)r->cpu_size;
 	if (r->pixels && !r->pixels_alias)
 		n += (LONG64)r->width * r->height * 4;
@@ -4170,12 +4521,17 @@ static void res_free_payload(Sw11Res *r, int drop_live)
 	r->pixels_swizzled = 0;
 	r->cpu_size = 0;
 	r->has_texels = 0;
+	free(r->bank); /* the faucet's backing copy; NULL-safe, and re-NULLed */
+	r->bank = NULL;
+	r->bank_size = 0;
 }
 
 static int res_ensure_pixels(Sw11Res *r)
 {
 	if (!r || r->kind != 1)
 		return 0;
+	if (r->phantom)
+		return 0; /* no pixels by design; the draw site binds magenta instead */
 	if (!r->pixels) {
 		/* Alias instead of duplicating where the two planes would hold
 		 * identical bytes.
@@ -4214,7 +4570,8 @@ static int res_ensure_pixels(Sw11Res *r)
 			if (swap)
 				r->cpu_dirty = 1;
 		} else {
-			r->pixels = (uint32_t *)payload_alloc((size_t)r->width * r->height * 4);
+			r->pixels = (uint32_t *)payload_alloc(
+				(size_t)r->width * r->height * 4, r, PL_PIXELS);
 			if (!r->pixels)
 				return 0;
 			r->plane_gen = g_save_gen;
@@ -4222,13 +4579,153 @@ static int res_ensure_pixels(Sw11Res *r)
 		}
 	}
 	if (fmt_is_depth(r->format) && !r->depth) {
-		r->depth = (float *)payload_alloc((size_t)r->width * r->height * sizeof(float));
+		r->depth = (float *)payload_alloc(
+			(size_t)r->width * r->height * sizeof(float), r, PL_DEPTH);
 		if (!r->depth)
 			return 0;
 		r->plane_gen = g_save_gen;
 		res_account((LONG64)r->width * r->height * (LONG64)sizeof(float), 0);
 	}
 	return 1;
+}
+
+/* ---- faucet: evict cold texture payloads to a bank, paint them back on draw ----
+ *
+ * D3D11SW_FAUCET=1 turns the resident cap into a WINDOW: only ~cap MB of texture
+ * pixels stay in the arena; the rest are evicted (arena copy freed, bank copy kept)
+ * and painted back into a fresh arena slot the next time they are drawn. The game
+ * holds a handle and never sees this - only the payload behind it moves. An evicted
+ * texture IS a phantom with a bank. Fault-in and eviction run ONLY on the draw
+ * thread, so no two allocations race the raster workers. LRU by a per-draw clock:
+ * every texture used in a draw is stamped with the current clock, and eviction only
+ * ever takes a strictly-older one, so nothing in flight is pulled from under a draw.
+ * This is Step 1 - an in-RAM bank; a disk bank comes later. */
+static int faucet_on(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		char v[8];
+		unsigned n = savestate_getenv("D3D11SW_FAUCET", v, sizeof(v));
+
+		cached = (n > 0 && n < sizeof(v) && v[0] == '1') ? 1 : 0;
+	}
+	return cached;
+}
+
+static volatile LONG g_lru_clock;
+static volatile LONG g_faucet_in, g_faucet_evict, g_faucet_stuck;
+
+/* Copy the current resident content to the bank, so it can be painted back after
+ * eviction. Called when content is established (create with data, upload). */
+static void faucet_bank_store(Sw11Res *r)
+{
+	if (!faucet_on() || !r || !r->cpu || !r->cpu_size ||
+	    !pl_cappable(r, PL_TEXTURE))
+		return;
+	if (r->bank_size != r->cpu_size) {
+		unsigned char *q = (unsigned char *)realloc(r->bank, r->cpu_size);
+
+		if (!q)
+			return;
+		r->bank = q;
+		r->bank_size = r->cpu_size;
+	}
+	memcpy(r->bank, r->cpu, r->cpu_size);
+}
+
+/* Free the arena copy of one least-recently-used resident texture, keeping its
+ * bank and description. Returns bytes freed, 0 if nothing was evictable. */
+static LONG64 faucet_evict_one(const Sw11Res *keep)
+{
+	Sw11Res *r, *victim = NULL;
+	unsigned best = 0;
+	LONG64 freed;
+
+	for (r = g_res_head; r; r = r->live_next) {
+		if (r == keep || r->kind != 1 || r->phantom || !r->cpu || !r->bank)
+			continue;
+		if (!pl_cappable(r, PL_TEXTURE))
+			continue;
+		if (r->lru == (unsigned)g_lru_clock)
+			continue; /* used this draw - never pull it from under the draw */
+		if (!victim || r->lru < best) {
+			victim = r;
+			best = r->lru;
+		}
+	}
+	if (!victim)
+		return 0;
+	swrast_flush_if_pending(victim->pixels); /* no worker still reading it */
+	freed = res_payload_bytes(victim);
+	res_account(-freed, 0);
+	payload_free(victim->cpu, victim->cpu_size);
+	if (!victim->pixels_alias)
+		payload_free(victim->pixels,
+			     (size_t)victim->width * victim->height * 4);
+	victim->cpu = NULL;
+	victim->pixels = NULL;
+	victim->pixels_alias = 0;
+	victim->pixels_swizzled = 0;
+	victim->phantom = 1; /* evicted: a phantom with a bank behind it */
+	InterlockedIncrement(&g_faucet_evict);
+	return freed;
+}
+
+static void faucet_ensure_room(size_t need, const Sw11Res *keep)
+{
+	unsigned cap = resident_cap_mb();
+
+	if (!cap)
+		return;
+	while ((LONG64)g_res_bytes + (LONG64)need > (LONG64)cap * 1024 * 1024)
+		if (!faucet_evict_one(keep))
+			break;
+}
+
+/* Paint an evicted texture back from its bank into a fresh arena slot, so the draw
+ * about to sample it gets real pixels. Draw thread only. */
+static int faucet_fault_in(Sw11Res *r)
+{
+	if (!r || !r->phantom || !r->bank)
+		return 0;
+	faucet_ensure_room(r->cpu_size, r);
+	r->cpu = (unsigned char *)payload_alloc(r->cpu_size, r, PL_TEXTURE);
+	if (!r->cpu) {
+		InterlockedIncrement(&g_faucet_stuck); /* window too small for even one */
+		return 0;                              /* stays magenta this draw */
+	}
+	memcpy(r->cpu, r->bank, r->cpu_size);
+	r->phantom = 0;
+	r->cpu_dirty = 1;
+	res_account((LONG64)r->cpu_size, 0);
+	r->lru = (unsigned)g_lru_clock;
+	if (InterlockedIncrement(&g_faucet_in) <= 24)
+		d11_log("FAUCET paint-in #%d %ux%u -> arena %p (live %.1f MB, %ld evict(s) "
+			"so far)",
+			r->id, r->width, r->height, (void *)r->cpu,
+			g_res_bytes / (1024.0 * 1024.0), (long)g_faucet_evict);
+	return 1;
+}
+
+/* Ensure an evicted texture has a resident cpu plane before the game writes to it
+ * (an upload). Paints in from the bank if there is one, else allocates an empty
+ * resident plane for the upload to land in; either way it is banked afterward. */
+static void faucet_make_resident(Sw11Res *r)
+{
+	if (!faucet_on() || !r || !r->phantom || !pl_cappable(r, PL_TEXTURE))
+		return;
+	if (r->bank) {
+		faucet_fault_in(r);
+		return;
+	}
+	faucet_ensure_room(r->cpu_size, r);
+	r->cpu = (unsigned char *)payload_alloc(r->cpu_size, r, PL_TEXTURE);
+	if (r->cpu) {
+		r->phantom = 0;
+		res_account((LONG64)r->cpu_size, 0);
+		r->lru = (unsigned)g_lru_clock;
+	}
 }
 
 static void res_copy_tex_rect(Sw11Res *d, UINT dx, UINT dy, Sw11Res *s, UINT sx, UINT sy,
@@ -5674,6 +6171,11 @@ static ULONG WINAPI Res_Release(Sw11Res *r)
 				r->cpu_size = 0;
 				r->has_texels = 0;
 			}
+			/* A retired texture is never drawn again, so its faucet bank is
+			 * dead weight - drop it even when the payload is retained. */
+			free(r->bank);
+			r->bank = NULL;
+			r->bank_size = 0;
 			r->retired = 1;
 			InterlockedExchange(&r->ref, 0);
 			InterlockedIncrement(&g_retired_n);
@@ -6223,24 +6725,66 @@ static HRESULT create_tex2d(Sw11Device *dev, const D3D11_TEXTURE2D_DESC *desc,
 	r->cpu_access = desc->CPUAccessFlags;
 	r->row_pitch = fmt_row_pitch(desc->Format, w);
 	r->cpu_size = fmt_size(desc->Format, w, h);
-	/* Counted as soon as it exists, so the failure path below can hand the
-	 * whole resource to res_free_payload and have the books balance. */
-	res_account((LONG64)r->cpu_size, 1);
-	if (r->cpu_size) {
-		r->cpu = (unsigned char *)payload_alloc(r->cpu_size);
-		if (!r->cpu) {
-			log_oom("a texture", (LONG64)r->cpu_size);
-			res_account(-(LONG64)r->cpu_size, -1);
-			free(r);
-			return E_OUTOFMEMORY;
+	if (faucet_on() && pl_cappable(r, PL_TEXTURE)) {
+		/* Faucet: make window room by evicting cold textures, then allocate this
+		 * one resident. It is banked below once its content is in place, so it can
+		 * be evicted and painted back later. If it will not fit even after
+		 * eviction, it is born evicted (a bank-less phantom for now - it gets a
+		 * bank on its first upload and paints in after that). */
+		faucet_ensure_room(r->cpu_size, NULL);
+		res_account((LONG64)r->cpu_size, 1);
+		if (r->cpu_size) {
+			r->cpu = (unsigned char *)payload_alloc(r->cpu_size, r, PL_TEXTURE);
+			if (!r->cpu) {
+				res_account(-(LONG64)r->cpu_size, 0); /* stays live, 0 bytes */
+				r->phantom = 1;
+				phantom_init();
+			} else if (mark_empty() && (!init || !init->pSysMem) &&
+				   !fmt_bc_block(desc->Format) &&
+				   !fmt_is_depth(desc->Format) &&
+				   fmt_stride(desc->Format) == 4) {
+				fill_magenta(r->cpu, r->cpu_size);
+			}
 		}
-		if (mark_empty() && (!init || !init->pSysMem) && !fmt_bc_block(desc->Format) &&
-		    !fmt_is_depth(desc->Format) && fmt_stride(desc->Format) == 4)
-			fill_magenta(r->cpu, r->cpu_size);
+		r->lru = (unsigned)g_lru_clock;
+	} else if (phantom_capped(r)) {
+		/* Over the resident cap (cap-only mode, no faucet): a phantom. Keep the
+		 * full description, hold no pixels, count zero resident bytes. It renders
+		 * magenta, never crashes, and is exactly the faucet's evicted state. */
+		static volatile LONG said;
+
+		r->phantom = 1;
+		res_account(0, 1); /* live, but holds nothing */
+		phantom_init();
+		if (InterlockedIncrement(&said) <= 32 || (said & 0x3FF) == 0)
+			d11_log("PHANTOM texture #%d %ux%u fmt=%d bind=%#x usage=%d - over "
+				"the %u MB cap, no pixels, live %.1f MB",
+				r->id, r->width, r->height, (int)r->format,
+				(unsigned)r->bind, (int)r->usage, resident_cap_mb(),
+				g_res_bytes / (1024.0 * 1024.0));
+	} else {
+		/* Counted as soon as it exists, so the failure path below can hand the
+		 * whole resource to res_free_payload and have the books balance. */
+		res_account((LONG64)r->cpu_size, 1);
+		if (r->cpu_size) {
+			r->cpu = (unsigned char *)payload_alloc(r->cpu_size, r,
+								PL_TEXTURE);
+			if (!r->cpu) {
+				log_oom("a texture", (LONG64)r->cpu_size);
+				res_account(-(LONG64)r->cpu_size, -1);
+				free(r);
+				return E_OUTOFMEMORY;
+			}
+			if (mark_empty() && (!init || !init->pSysMem) &&
+			    !fmt_bc_block(desc->Format) && !fmt_is_depth(desc->Format) &&
+			    fmt_stride(desc->Format) == 4)
+				fill_magenta(r->cpu, r->cpu_size);
+		}
 	}
-	if ((desc->BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE |
+	if (!r->phantom &&
+	    ((desc->BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE |
 				 D3D11_BIND_DEPTH_STENCIL)) ||
-	    fmt_is_depth(desc->Format)) {
+	     fmt_is_depth(desc->Format))) {
 		if (!res_ensure_pixels(r)) {
 			log_oom("a render surface", (LONG64)w * h * 4);
 			/* It may have got one plane before failing on the next,
@@ -6287,6 +6831,10 @@ static HRESULT create_tex2d(Sw11Device *dev, const D3D11_TEXTURE2D_DESC *desc,
 		if (r->pixels)
 			res_decode_pixels_written(r);
 	}
+	/* Bank the content now it is in place, so the faucet can evict and paint it
+	 * back. A texture created empty (no init data) gets its bank on first upload. */
+	if (init && init->pSysMem)
+		faucet_bank_store(r);
 	*out = r;
 	return S_OK;
 }
@@ -6310,7 +6858,7 @@ static HRESULT create_buf(Sw11Device *dev, const D3D11_BUFFER_DESC *desc,
 	r->cpu_access = desc->CPUAccessFlags;
 	r->byte_width = desc->ByteWidth;
 	r->cpu_size = desc->ByteWidth;
-	r->cpu = (unsigned char *)payload_alloc(desc->ByteWidth);
+	r->cpu = (unsigned char *)payload_alloc(desc->ByteWidth, r, PL_BUFFER);
 	if (!r->cpu) {
 		log_oom("a buffer", (LONG64)desc->ByteWidth);
 		free(r);
@@ -6486,6 +7034,12 @@ static void perf_tick(void)
 					(double)g_arena.size / (1024.0 * 1024.0),
 					(unsigned)(uintptr_t)g_arena.base, g_arena.n,
 					g_arena.peak_ext, g_arena.fallbacks);
+			if (faucet_on())
+				d11_log("perf faucet: %ld paint-in(s), %ld evict(s), %ld stuck "
+					"(window too small) - resident %.1f MB of a %u MB window",
+					(long)g_faucet_in, (long)g_faucet_evict,
+					(long)g_faucet_stuck,
+					g_res_bytes / (1024.0 * 1024.0), resident_cap_mb());
 		}
 		{
 			/* Reported next to memory because that is what makes a bin
@@ -6813,6 +7367,30 @@ static int pace_catchup(void)
 	return v;
 }
 
+/* Whether a frame that arrives already behind presents at once.
+ *
+ * Giving up on catching up restarts the schedule from now, and the restart
+ * used to put the next deadline a full frame ahead and then sleep to it. A
+ * scene whose work alone takes longer than two frames trips the restart every
+ * frame, so every frame paid a whole extra interval on top of its work plus a
+ * compositor flush. Measured at 40 ms of work into a 60 fps target: 34 resets
+ * in 34 frames, 18.4 ms of each 60 ms frame asleep.
+ *
+ * 1 (default) skips the flush when behind and presents a restarted frame
+ * immediately, starting the new schedule from it. 0 restores the old wait. */
+static int pace_late_skip(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		char buf[8];
+		unsigned n = savestate_getenv("D3D11SW_PACE_LATE_SKIP", buf, sizeof(buf));
+
+		v = (n && buf[0] == '0') ? 0 : 1;
+	}
+	return v;
+}
+
 static void present_wait(HWND hwnd, UINT sync)
 {
 	static HRESULT(WINAPI * dwm_flush)(void);
@@ -6869,7 +7447,9 @@ static void present_wait(HWND hwnd, UINT sync)
 	 * below already does, and correctly, because it accumulates from a fixed
 	 * origin and so absorbs the work instead of following it. The single flush
 	 * that remains is only to start the wait on a composition boundary. */
-	if (dwm_flush && pace_flushes()) {
+	QueryPerformanceCounter(&now);
+	if (dwm_flush && pace_flushes() &&
+	    !(pace_late_skip() && next.QuadPart && now.QuadPart > next.QuadPart)) {
 		LARGE_INTEGER d0, d1;
 
 		QueryPerformanceCounter(&d0);
@@ -6908,8 +7488,12 @@ static void present_wait(HWND hwnd, UINT sync)
 								(double)frame
 						      : 0.0);
 			}
-			next.QuadPart = now.QuadPart;
 			g_pace_resets++;
+			if (next.QuadPart && pace_late_skip()) {
+				next.QuadPart = now.QuadPart + frame;
+				return;
+			}
+			next.QuadPart = now.QuadPart;
 		}
 		next.QuadPart += frame;
 	}
@@ -8806,6 +9390,19 @@ static HRESULT WINAPI Ctx_Map(ID3D11DeviceContext1 *this, ID3D11Resource *res, U
 	if (!mapped)
 		return E_INVALIDARG;
 	memset(mapped, 0, sizeof(*mapped));
+	if (r && r->phantom) {
+		/* No pixels of its own: hand back the shared scratch at the resource's
+		 * real size, so an upload sized to the full description writes somewhere
+		 * valid. The write is discarded on Unmap - the texture stays magenta. */
+		unsigned char *s = phantom_scratch(r->cpu_size ? r->cpu_size : 4u);
+
+		if (!s)
+			return E_OUTOFMEMORY;
+		mapped->pData = s;
+		mapped->RowPitch = r->kind ? r->row_pitch : r->byte_width;
+		mapped->DepthPitch = r->cpu_size;
+		return S_OK;
+	}
 	res_reclaim_cpu(r);
 	if (!r || !r->cpu) {
 		/* A refused Map leaves pData null. A game that checks the HRESULT
@@ -8848,6 +9445,21 @@ static HRESULT WINAPI Ctx_Map(ID3D11DeviceContext1 *this, ID3D11Resource *res, U
 	mapped->RowPitch = r->kind ? r->row_pitch : r->byte_width;
 	mapped->DepthPitch = r->cpu_size;
 	map_track(r->cpu, r->cpu_size, r->id, (int)r->bind, r->kind);
+	mapprobe_clear(r); /* legitimate map: drop any guard so it is not miscounted */
+	if (mapprobe_on()) {
+		int isread = (type == D3D11_MAP_READ || type == D3D11_MAP_READ_WRITE);
+		int big = r->cpu_size >= 0x20000; /* >=128 KB = a page-aligned payload */
+
+		InterlockedIncrement(&g_mc_calls);
+		if (isread)
+			InterlockedIncrement(&g_mc_read);
+		if (big)
+			InterlockedIncrement(&g_mc_big);
+		if (big && isread)
+			InterlockedIncrement(&g_mc_bigread);
+		if (!((uintptr_t)r->cpu & 0xFFF))
+			InterlockedIncrement(&g_mc_aligned);
+	}
 	if (r->kind == 1) {
 		/* The readback question, answered permanently rather than under a
 		 * trace flag that costs more than the rasterising it describes.
@@ -8899,6 +9511,9 @@ static void WINAPI Ctx_Unmap(ID3D11DeviceContext1 *this, ID3D11Resource *res, UI
 		res_decode_pixels_written(r);
 	if (c && c->dev)
 		unlock_dev(c->dev);
+	/* Guard the payload now it is unmapped: any access from here until the next
+	 * Map is either our raster (expected) or the game holding a raw pointer. */
+	mapprobe_arm(r);
 }
 
 static void WINAPI Ctx_UpdateSubresource(ID3D11DeviceContext1 *this, ID3D11Resource *res, UINT sub,
@@ -8912,6 +9527,7 @@ static void WINAPI Ctx_UpdateSubresource(ID3D11DeviceContext1 *this, ID3D11Resou
 	if (!r || !src)
 		return;
 	res_reclaim_cpu(r);
+	faucet_make_resident(r); /* an evicted texture needs a plane to upload into */
 	if (c && c->dev)
 		lock_dev(c->dev);
 	if (r->kind == 0) {
@@ -9018,6 +9634,7 @@ static void WINAPI Ctx_UpdateSubresource(ID3D11DeviceContext1 *this, ID3D11Resou
 		}
 		if (r->pixels)
 			res_decode_pixels_written(r);
+		faucet_bank_store(r); /* content changed: refresh the bank */
 	}
 	if (c && c->dev)
 		unlock_dev(c->dev);
@@ -9942,10 +10559,38 @@ static void ctx_draw_inner(Sw11Context *c, UINT count, UINT start, INT base, int
 	{
 		int si;
 		a8_font = 0;
+		/* One tick per draw, so every texture used here shares this stamp and
+		 * eviction (which only takes strictly-older ones) can never pull a texture
+		 * out from under the draw that is using it. Draw thread only. */
+		if (faucet_on())
+			InterlockedIncrement(&g_lru_clock);
 		for (si = 0; si < 4; si++) {
+			/* Faucet: an evicted (phantom-with-bank) texture is painted back into
+			 * the arena here, on the draw thread, before it is sampled. If it fits
+			 * the window it becomes a real texture below; if not it stays magenta. */
+			if (c->ps_srv[si] && c->ps_srv[si]->res &&
+			    c->ps_srv[si]->res->phantom && faucet_on())
+				faucet_fault_in(c->ps_srv[si]->res);
+			if (c->ps_srv[si] && c->ps_srv[si]->res &&
+			    c->ps_srv[si]->res->phantom) {
+				/* A capped texture: sample the magenta placeholder at 16x16
+				 * with clamp addressing, so the sampler stays in bounds no
+				 * matter the texture's real dimensions. Visible, never a
+				 * crash. First phantom wins, like the real-texture case. */
+				tex.pixels = g_phantom_px;
+				tex.width = PHANTOM_DIM;
+				tex.height = PHANTOM_DIM;
+				src_res = c->ps_srv[si]->res;
+				st.bilinear = 0;
+				st.addr_u = D3DTADDRESS_CLAMP;
+				st.addr_v = D3DTADDRESS_CLAMP;
+				break;
+			}
 			if (c->ps_srv[si] && c->ps_srv[si]->res && res_ensure_pixels(c->ps_srv[si]->res) &&
 			    c->ps_srv[si]->res->pixels) {
 				Sw11Res *tr = c->ps_srv[si]->res;
+
+				tr->lru = (unsigned)g_lru_clock; /* mark used this draw */
 				int a8 = (tr->format == DXGI_FORMAT_A8_UNORM ||
 					   tr->format == DXGI_FORMAT_R8_UNORM ||
 					   tr->format == DXGI_FORMAT_R8_UINT);

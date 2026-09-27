@@ -50,6 +50,10 @@
 #include "savestate.h"
 
 void savestate_log_line(const char *s);
+/* Drop this region from the SWEXCLUDE held set: its ORIGIN is this DLL, so the
+ * Nt hook records it as renderer memory, but audio chunks must rewind with the
+ * game or the PCM stream seams. No-op unless SWEXCLUDE armed the hook. */
+void gameheap_va_unhold(void *base);
 
 static void ss_log(const char *fmt, ...)
 {
@@ -269,6 +273,9 @@ static void *arena_alloc(SIZE_T n)
 		p = VirtualAlloc(NULL, want, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 		if (!p)
 			return NULL;
+		/* Audio buffers rewind with the game; keep SWEXCLUDE from holding them
+		 * in the present, which malforms the PCM stream. */
+		gameheap_va_unhold(p);
 		if (n > XA2_CHUNK)
 			return p;
 		g_chunk = (unsigned char *)p;

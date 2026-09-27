@@ -67,6 +67,24 @@ if ($LASTEXITCODE -eq 0) { "built dispprobe32.exe (monitor size and refresh prob
 & $zig cc @warn -target x86-windows-gnu -o baseprobe32.exe baseprobe.c
 if ($LASTEXITCODE -eq 0) { "built baseprobe32.exe (ASLR image base probe)" }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# Models the cross-session THREAD boundary in one process: run workers over a
+# shared world, snapshot, kill them, spawn fresh threads at OS-chosen stacks, and
+# try to continue two ways - adopt (restore saved stacks + contexts, gated on the
+# saved stack address being free) vs data-only (rewind just the world, leave the
+# fresh runners alone). Standalone; the question it answers is about threads, not
+# the engine. 32-bit to match the titles.
+& $zig cc @warn -target x86-windows-gnu -o thread_harness32.exe thread_harness.c
+if ($LASTEXITCODE -eq 0) { "built thread_harness32.exe (cross-session thread rebuild, no game)" }
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# Reads the slotfiles the engine writes under D3D9SW_SLOTFILE=1 and says what a
+# save contains aside from addresses, or whether two sessions' saves are the same
+# content at shifted addresses. Standalone - it links nothing from the engine,
+# because it only parses the .regions text and the .bin bytes on disk.
+& $zig cc @warn -target x86_64-windows-gnu -o savediff.exe savediff.c
+if ($LASTEXITCODE -eq 0) { "built savediff.exe (offline save content and diff, no game)" }
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Write-Host "built ss_harness32.exe (savestate engine, PE32)"
 
 # test_simd.exe only compares the scalar rasteriser against the vector one, so a
