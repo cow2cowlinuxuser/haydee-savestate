@@ -176,12 +176,8 @@ static unsigned long g_lock_fail;
 
 static void *lock_sink(void)
 {
-	if (!g_sink) {
-		g_sink = VirtualAlloc(NULL, SINK_BYTES, MEM_COMMIT | MEM_RESERVE,
-				      PAGE_READWRITE);
-		if (g_sink)
-			savestate_exclude(g_sink, SINK_BYTES);
-	}
+	if (!g_sink)
+		g_sink = savestate_kept(SS_KEPT_DS_SINK, SINK_BYTES);
 	return g_sink;
 }
 static void **g_buf_vtbl;
@@ -1084,12 +1080,10 @@ void dsh_mark_present(void)
 	if (!g_ready)
 		return;
 	if (!g_present) {
-		g_present = (PresentSet *)VirtualAlloc(NULL, sizeof(PresentSet),
-						       MEM_COMMIT | MEM_RESERVE,
-						       PAGE_READWRITE);
+		g_present = (PresentSet *)savestate_kept(SS_KEPT_DS_PRESENT,
+							 sizeof(PresentSet));
 		if (!g_present)
 			return;
-		savestate_exclude(g_present, sizeof(PresentSet));
 	}
 	g_present->n = 0;
 	EnterCriticalSection(&g_cs);

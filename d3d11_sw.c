@@ -19,6 +19,7 @@
 #include "savestate.h"
 #include "swalloc.h"
 #include "swrast.h"
+#include "gpuhost.h"
 #include "vtbl_arity.h"
 
 #define BCDEC_STATIC
@@ -87,6 +88,21 @@ struct Sw11Device {
 	UINT latency;
 };
 
+/* What a texture's colours look like, taken under D3D11SW_PAINTSTAT once per
+ * content change. Alpha 0 counts as one colour whatever its RGB, because it
+ * paints nothing either way. A block is 4x4 texels; a solid block is one colour
+ * throughout. Only a solid block whose left neighbour block is a different
+ * colour (or not solid) starts a run: the rest continue the one beside them,
+ * which is what a run-length fill would get for free. Texel runs are the same
+ * question asked per texel along each row. */
+typedef struct TexPal {
+	unsigned gen; /* gpu_gen + 1 it describes; 0 never taken */
+	unsigned at;  /* present count when taken */
+	unsigned colors; /* distinct colours, 257 meaning more than 256 */
+	unsigned blocks, clear, solid, white, black, runs;
+	unsigned texels, texel_runs;
+} TexPal;
+
 struct Sw11Res {
 	union {
 		ID3D11Texture2D tex;
@@ -145,7 +161,8 @@ struct Sw11Res {
 	 * handle never changes - only the payload behind it moves. */
 	unsigned char *bank;
 	UINT bank_size;
-	unsigned lru; /* draw-clock stamp of last use, for least-recently-used evict */
+	unsigned lru;        /* present count at last use, for least-recently-used evict */
+	unsigned evicted_at; /* present count at eviction, to tell thrash from churn */
 	int id;
 	/* Retired rather than freed, so the game can still name it. Distinct from a
 	 * NULL pixels pointer, which also means an ordinary untextured draw. */
@@ -180,6 +197,7 @@ struct Sw11Res {
 	 * that crosses between the two has to be converted, and the conversions are
 	 * exactly rt_scale_x/y below plus the copy paths. */
 	UINT virt_w, virt_h;
+	TexPal pal;
 };
 
 /* Per-frame accounting of which render target actually received geometry.
@@ -352,6 +370,7 @@ typedef struct PerfTex {
 	int blend;
 	double px;
 	unsigned draws;
+	TexPal pal;
 } PerfTex;
 static PerfTex g_perf_tex[PERF_TEX_MAX];
 static int g_perf_ntex;
@@ -405,13 +424,149 @@ static const char *blend_factor_name(int f)
 	}
 }
 
-static void perf_note_tex(int id, int tw, int th, int blend, double px)
+/* Screen area drawn this window from textures with a colour census, weighted by
+ * what the census found, so the answer is "how much of what we paint comes from
+ * flat art" rather than "how many textures are flat". */
+enum { PAL_PX, PAL_PX_RT, PAL_PX_NONE, PAL_C2, PAL_C16, PAL_C256, PAL_CMANY, PAL_CLEAR,
+       PAL_SOLID, PAL_WHITE, PAL_BLACK, PAL_RUNS, PAL_TEXRUN, PAL_N };
+static double g_pal[PAL_N];
+static volatile LONG g_present_n;
+
+static int pal_is_rt(const Sw11Res *r)
+{
+	return (r->bind & D3D11_BIND_RENDER_TARGET) != 0;
+}
+
+static void pal_take(Sw11Res *r)
+{
+	/* Open addressing over twice the cap; alpha 0 folds to 0, and 0 is also the
+	 * empty marker, so it is tracked with its own flag. */
+	uint32_t set[512];
+	int have_clear = 0;
+	unsigned w = r->width, h = r->height, x, y, bx, by, ncol = 0;
+	const uint32_t *p = r->pixels;
+	TexPal t;
+
+	memset(&t, 0, sizeof(t));
+	memset(set, 0, sizeof(set));
+#define PAL_NORM(v) (((v) >> 24) ? (v) : 0u)
+	for (y = 0; y < h; y++) {
+		const uint32_t *row = p + (size_t)y * w;
+		uint32_t prev = 0;
+
+		for (x = 0; x < w; x++) {
+			uint32_t v = PAL_NORM(row[x]);
+
+			if (x == 0 || v != prev)
+				t.texel_runs++;
+			prev = v;
+			if (ncol > 256)
+				continue;
+			if (!v) {
+				if (!have_clear) {
+					have_clear = 1;
+					ncol++;
+				}
+			} else {
+				unsigned k = (v * 2654435761u) >> 23;
+
+				while (set[k] && set[k] != v)
+					k = (k + 1) & 511;
+				if (!set[k]) {
+					set[k] = v;
+					ncol++;
+				}
+			}
+		}
+	}
+	t.texels = w * h;
+	t.colors = ncol > 256 ? 257 : ncol;
+	for (by = 0; by + 4 <= h; by += 4) {
+		int prev_solid = 0;
+		uint32_t prev_col = 0;
+
+		for (bx = 0; bx + 4 <= w; bx += 4) {
+			const uint32_t *b = p + (size_t)by * w + bx;
+			uint32_t c = PAL_NORM(b[0]);
+			int solid = 1, i;
+
+			for (i = 0; i < 16 && solid; i++)
+				solid = PAL_NORM(b[(size_t)(i >> 2) * w + (i & 3)]) == c;
+			t.blocks++;
+			if (solid) {
+				if (!c)
+					t.clear++;
+				else
+					t.solid++;
+				if (c == 0xffffffffu)
+					t.white++;
+				else if (c && !(c & 0x00ffffffu))
+					t.black++;
+				if (!prev_solid || prev_col != c)
+					t.runs++;
+			}
+			prev_solid = solid;
+			prev_col = c;
+		}
+	}
+#undef PAL_NORM
+	t.gen = r->gpu_gen + 1;
+	t.at = (unsigned)g_present_n;
+	r->pal = t;
+}
+
+/* Once per content change, but a texture the game rewrites every frame would
+ * then be rescanned every frame, so a changed one waits two seconds. */
+static void pal_maybe_take(Sw11Res *r)
+{
+	if (!swrast_paintstat || !r || !r->pixels || pal_is_rt(r) || r->phantom)
+		return;
+	if (r->pal.gen == r->gpu_gen + 1)
+		return;
+	if (r->pal.gen && (unsigned)g_present_n - r->pal.at < 120)
+		return;
+	pal_take(r);
+}
+
+static void pal_note(const Sw11Res *r, double px)
+{
+	const TexPal *t;
+	double b;
+
+	if (!swrast_paintstat || !r || px <= 0.0)
+		return;
+	g_pal[PAL_PX] += px;
+	if (pal_is_rt(r)) {
+		g_pal[PAL_PX_RT] += px;
+		return;
+	}
+	t = &r->pal;
+	if (!t->gen || !t->texels) {
+		g_pal[PAL_PX_NONE] += px;
+		return;
+	}
+	g_pal[t->colors <= 2 ? PAL_C2 : t->colors <= 16 ? PAL_C16 : t->colors <= 256 ? PAL_C256
+									     : PAL_CMANY] += px;
+	b = t->blocks ? px / (double)t->blocks : 0.0;
+	g_pal[PAL_CLEAR] += b * t->clear;
+	g_pal[PAL_SOLID] += b * t->solid;
+	g_pal[PAL_WHITE] += b * t->white;
+	g_pal[PAL_BLACK] += b * t->black;
+	g_pal[PAL_RUNS] += b * t->runs;
+	g_pal[PAL_TEXRUN] += px * (double)t->texel_runs / (double)t->texels;
+}
+
+static void perf_note_tex(const Sw11Res *src, int id, int tw, int th, int blend, double px)
 {
 	int i;
+
+	pal_note(src, px);
 	for (i = 0; i < g_perf_ntex; i++)
 		if (g_perf_tex[i].id == id) {
 			g_perf_tex[i].px += px;
 			g_perf_tex[i].draws++;
+			if (src)
+				g_perf_tex[i].pal = src->pal;
 			return;
 		}
 	if (g_perf_ntex < PERF_TEX_MAX) {
@@ -421,13 +576,16 @@ static void perf_note_tex(int id, int tw, int th, int blend, double px)
 		g_perf_tex[g_perf_ntex].blend = blend;
 		g_perf_tex[g_perf_ntex].px = px;
 		g_perf_tex[g_perf_ntex].draws = 1;
+		if (src)
+			g_perf_tex[g_perf_ntex].pal = src->pal;
 		g_perf_ntex++;
 	}
 }
 
-static void perf_note_area(Sw11Res *rt, const SwTri *tris, unsigned n, int tex_id, int tw,
-			   int th, int blend)
+static void perf_note_area(Sw11Res *rt, const SwTri *tris, unsigned n, const Sw11Res *src,
+			   int tw, int th, int blend)
 {
+	int tex_id = src ? src->id : -1;
 	double px = 0.0;
 	unsigned t;
 	int i;
@@ -450,7 +608,7 @@ static void perf_note_area(Sw11Res *rt, const SwTri *tris, unsigned n, int tex_i
 		if (x1 > x0 && y1 > y0)
 			px += 0.5 * (double)(x1 - x0) * (double)(y1 - y0);
 	}
-	perf_note_tex(tex_id, tw, th, blend, px);
+	perf_note_tex(src, tex_id, tw, th, blend, px);
 	for (i = 0; i < g_perf_nrt; i++)
 		if (g_perf_rt[i].id == rt->id) {
 			g_perf_rt[i].px += px;
@@ -1282,6 +1440,209 @@ static int owned_build(void);
 static void owned_done(void);
 static int owned_holds(const void *p);
 
+/* The objects the game keeps one of - device, immediate context, swap chain,
+ * factory, adapter, output - at the same address in every launch.
+ *
+ * The game stores raw pointers to them in its own memory, and a restore from
+ * another process puts those pointers back. From the heap they land wherever
+ * that launch's heap happened to be; the first cross-session restore to get
+ * this far called RSSetViewports through an immediate context pointer that
+ * now pointed into the savestate control block. This pool is static storage in
+ * an image pinned at a fixed base, and first-fit over the same sequence of
+ * creates and releases, so the Nth object comes out at the same address each
+ * launch. The image is held in the present, so the object there is this
+ * launch's own, working one. The pin log line is how two launches are compared
+ * to confirm the sequence really does repeat. */
+#define PIN_UNIT 64u
+#define PIN_UNITS 131072u
+static unsigned char g_pin_mem[PIN_UNIT * PIN_UNITS] __attribute__((aligned(64)));
+static unsigned short g_pin_len[PIN_UNITS];
+/* What each run holds, so a load from another launch can say how many of the
+ * game's restored pointers land on an object of the same kind in this one. */
+enum { PK_FREE, PK_SINGLE, PK_RES, PK_VIEW, PK_SHADER, PK_LAYOUT, PK_BLEND, PK_DS, PK_RAST,
+       PK_SAMP, PK_QUERY, PK_N };
+static const char *const g_pk_name[PK_N] = { "free",   "singleton", "resource", "view",
+					     "shader", "layout",    "blend",    "depth-stencil",
+					     "raster", "sampler",   "query" };
+static unsigned char g_pin_kind[PIN_UNITS];
+static volatile LONG g_pin_lock;
+static unsigned g_pin_seq;
+static LONG g_pin_full_logged;
+/* Unit index + 1 the next pin_calloc on this thread must use instead of first
+ * fit, for rebuilding a saved object at the address the game holds for it. */
+static unsigned g_pin_at;
+static DWORD g_pin_at_tid;
+static int g_pin_foreign_seen;
+
+static void *pin_calloc(size_t bytes, const char *what, unsigned char kind)
+{
+	unsigned need = (unsigned)((bytes + PIN_UNIT - 1) / PIN_UNIT), i = 0, run;
+	void *p = NULL;
+
+	while (InterlockedCompareExchange(&g_pin_lock, 1, 0) != 0)
+		YieldProcessor();
+	if (!g_pin_seq)
+		savestate_follow_save_range(g_pin_mem, sizeof(g_pin_mem));
+	if (g_pin_at && g_pin_at_tid == GetCurrentThreadId()) {
+		i = g_pin_at - 1;
+		g_pin_at = 0;
+		for (run = 0; run < need && i + run < PIN_UNITS && !g_pin_len[i + run]; run++)
+			;
+		if (need && need <= 0xFFFF && run == need) {
+			g_pin_len[i] = (unsigned short)need;
+			g_pin_kind[i] = kind;
+			for (run = 1; run < need; run++)
+				g_pin_len[i + run] = 0xFFFF;
+			p = g_pin_mem + (size_t)i * PIN_UNIT;
+		}
+		i = 0;
+	}
+	while (!p && need && need <= 0xFFFF && i + need <= PIN_UNITS) {
+		for (run = 0; run < need && !g_pin_len[i + run]; run++)
+			;
+		if (run == need) {
+			g_pin_len[i] = (unsigned short)need;
+			g_pin_kind[i] = kind;
+			for (run = 1; run < need; run++)
+				g_pin_len[i + run] = 0xFFFF;
+			p = g_pin_mem + (size_t)i * PIN_UNIT;
+			break;
+		}
+		i += run + (g_pin_len[i + run] == 0xFFFF ? 1 : g_pin_len[i + run]);
+	}
+	g_pin_seq++;
+	InterlockedExchange(&g_pin_lock, 0);
+	if (!p) {
+		if (!InterlockedExchange(&g_pin_full_logged, 1))
+			d11_log("pin: pool full at %s (%u bytes) - this and later objects come "
+				"from the heap and will not keep their address across launches",
+				what, (unsigned)bytes);
+		return calloc(1, bytes);
+	}
+	memset(p, 0, bytes);
+	if (kind == PK_SINGLE)
+		d11_log("pin: %s #%u at %p, %u bytes", what, g_pin_seq, p, (unsigned)bytes);
+	return p;
+}
+
+/* The pool's layout as the save saw it, beside the slot. Written before the save
+ * rather than after, because a restored thread resumes inside the save and
+ * returns through it. */
+static void pin_map_write(int slot)
+{
+	char path[64];
+	HANDLE f;
+	DWORD w;
+
+	wsprintfA(path, "d3d9sw_slot%d.pins", slot);
+	f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (f == INVALID_HANDLE_VALUE)
+		return;
+	while (InterlockedCompareExchange(&g_pin_lock, 1, 0) != 0)
+		YieldProcessor();
+	WriteFile(f, g_pin_len, sizeof(g_pin_len), &w, NULL);
+	WriteFile(f, g_pin_kind, sizeof(g_pin_kind), &w, NULL);
+	WriteFile(f, g_pin_mem, sizeof(g_pin_mem), &w, NULL);
+	InterlockedExchange(&g_pin_lock, 0);
+	CloseHandle(f);
+}
+
+static void pin_rebuild(const unsigned short *sl, const unsigned char *sk,
+			const unsigned char *smem);
+
+/* After a load from another launch: for every object the save's pool held, is
+ * there an object of the same kind and size at that address now? The game's
+ * restored pointers go to those addresses, and nothing else is put there. */
+static void pin_map_compare(int slot)
+{
+	static unsigned short sl[PIN_UNITS];
+	static unsigned char sk[PIN_UNITS];
+	unsigned same[PK_N], sized[PK_N], other[PK_N], gone[PK_N], extra = 0, i;
+	char path[64];
+	HANDLE f;
+	DWORD r1 = 0, r2 = 0, r3 = 0;
+	unsigned char *smem;
+	int k;
+
+	wsprintfA(path, "d3d9sw_slot%d.pins", slot);
+	f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+	if (f == INVALID_HANDLE_VALUE) {
+		d11_log("pin map: no %s to compare against", path);
+		return;
+	}
+	ReadFile(f, sl, sizeof(sl), &r1, NULL);
+	ReadFile(f, sk, sizeof(sk), &r2, NULL);
+	if (r1 != sizeof(sl) || r2 != sizeof(sk)) {
+		CloseHandle(f);
+		d11_log("pin map: %s is from a different pool size, not compared", path);
+		return;
+	}
+	smem = (unsigned char *)VirtualAlloc(NULL, sizeof(g_pin_mem), MEM_COMMIT | MEM_RESERVE,
+					     PAGE_READWRITE);
+	if (smem && (!ReadFile(f, smem, sizeof(g_pin_mem), &r3, NULL) || r3 != sizeof(g_pin_mem))) {
+		VirtualFree(smem, 0, MEM_RELEASE);
+		smem = NULL;
+	}
+	CloseHandle(f);
+	memset(same, 0, sizeof(same));
+	memset(sized, 0, sizeof(sized));
+	memset(other, 0, sizeof(other));
+	memset(gone, 0, sizeof(gone));
+	for (i = 0; i < PIN_UNITS; i++) {
+		unsigned kind = sk[i] < PK_N ? sk[i] : PK_FREE;
+		int live_start = g_pin_len[i] && g_pin_len[i] != 0xFFFF;
+
+		if (live_start && !(sl[i] && sl[i] != 0xFFFF))
+			extra++;
+		if (!sl[i] || sl[i] == 0xFFFF)
+			continue;
+		if (!live_start)
+			gone[kind]++;
+		else if (g_pin_kind[i] != sk[i])
+			other[kind]++;
+		else if (g_pin_len[i] != sl[i])
+			sized[kind]++;
+		else
+			same[kind]++;
+	}
+	d11_log("pin map: slot %d's objects against this launch's pool - same kind and size / "
+		"same kind, other size / another kind there / nothing there",
+		slot);
+	for (k = 1; k < PK_N; k++)
+		if (same[k] + sized[k] + other[k] + gone[k])
+			d11_log("  %-14s %6u / %6u / %6u / %6u", g_pk_name[k], same[k], sized[k],
+				other[k], gone[k]);
+	d11_log("  and %u object(s) in this launch's pool at addresses the save had empty",
+		extra);
+	if (!smem) {
+		d11_log("pin map: %s holds no object contents (written by an older build), so "
+			"nothing is rebuilt",
+			path);
+		return;
+	}
+	pin_rebuild(sl, sk, smem);
+	VirtualFree(smem, 0, MEM_RELEASE);
+}
+
+static void obj_free(void *p)
+{
+	unsigned i, n;
+
+	if ((unsigned char *)p < g_pin_mem ||
+	    (unsigned char *)p >= g_pin_mem + sizeof(g_pin_mem)) {
+		free(p);
+		return;
+	}
+	i = (unsigned)(((unsigned char *)p - g_pin_mem) / PIN_UNIT);
+	while (InterlockedCompareExchange(&g_pin_lock, 1, 0) != 0)
+		YieldProcessor();
+	n = g_pin_len[i];
+	g_pin_kind[i] = PK_FREE;
+	while (n && n != 0xFFFF && n--)
+		g_pin_len[i + n] = 0;
+	InterlockedExchange(&g_pin_lock, 0);
+}
+
 /* A restore has completed and the threads are running again. Anything recorded
  * after the mark is unreachable: the game's memory no longer holds a pointer to
  * it, and neither does this module's, because both were rewound past its
@@ -1316,6 +1677,15 @@ static void ledger_reap(void)
 
 	if (!l)
 		return;
+	/* The mark, the live list and the payloads were this process's; a slot
+	 * from another one leaves the list holding that process's pointers, and
+	 * walking it faulted in owned_build. Leaking is the safe half here too. */
+	if (savestate_last_load_foreign()) {
+		d11_log("skipped the payload reap: the slot came from another process, "
+			"so what this one created since the save is not something the "
+			"restored memory can say anything about");
+		return;
+	}
 	/* Before the ledger lock, because it takes the live-list lock and the
 	 * retain lock, and nothing else acquires those in the other order. */
 	if (!owned_build()) {
@@ -2848,6 +3218,66 @@ static int mul_identity(void)
  *   3  neutralise every blended draw. The blunt version, for when 2 says no.
  *
  * All three are diagnostics and all three make the game look wrong on purpose. */
+/* D3D11SW_EXP_TRANSP asks what transparency costs, by removing it:
+ *
+ *   1  skip every blended draw outright. The ceiling on what sprites and
+ *      their transparent area cost; opaque parts of them vanish too.
+ *   2  draw everything opaque, so nothing reads the destination. Every
+ *      pixel is still sampled, so against 0 this is the cost of blending
+ *      alone, not of transparent area.
+ *
+ * Re-read every 120 presents so it can be flipped while the game runs. The
+ * picture is wrong on purpose under both. */
+static volatile LONG g_exp_transp;
+
+static void exp_transp_refresh(void)
+{
+	static const char key[] = "D3D11SW_EXP_TRANSP";
+	char path[MAX_PATH], line[256], *slash;
+	HMODULE self = NULL;
+	DWORD n;
+	FILE *f;
+	LONG v = 0;
+
+	/* Straight from the file each time: the environment route is read once
+	 * and memoised, which is right for every other knob and wrong for this. */
+	if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			       (LPCSTR)(void *)exp_transp_refresh, &self))
+		return;
+	n = GetModuleFileNameA(self, path, sizeof(path));
+	if (!n || n >= sizeof(path) || !(slash = strrchr(path, '\\')) ||
+	    (size_t)(slash - path) + sizeof("d3d11_sw.cfg") + 1 > sizeof(path))
+		return;
+	memcpy(slash + 1, "d3d11_sw.cfg", sizeof("d3d11_sw.cfg"));
+	f = fopen(path, "r");
+	if (f) {
+		while (fgets(line, sizeof(line), f)) {
+			char *p = line;
+
+			while (*p == ' ' || *p == '\t')
+				p++;
+			if (strncmp(p, key, sizeof(key) - 1) != 0)
+				continue;
+			p += sizeof(key) - 1;
+			while (*p == ' ' || *p == '\t')
+				p++;
+			if (*p++ != '=')
+				continue;
+			while (*p == ' ' || *p == '\t')
+				p++;
+			v = (LONG)(*p - '0');
+		}
+		fclose(f);
+	}
+	if (v < 0 || v > 2)
+		v = 0;
+	if (v != g_exp_transp)
+		d11_log("D3D11SW_EXP_TRANSP now %ld (%s)", (long)v,
+			v == 1 ? "blended draws skipped" : v == 2 ? "blending off" : "normal");
+	g_exp_transp = v;
+}
+
 static int break_blend(void)
 {
 	static int v = -1;
@@ -3087,6 +3517,8 @@ static void dsound_claim(void)
 		shown);
 }
 
+static void gh_shutdown(void);
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
 	/* Announce the attach so that a missing detach line is evidence of
@@ -3104,9 +3536,11 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 		profile_seed_env();
 		hook_getprocaddress();
 		dsound_claim();
-	} else if (reason == DLL_PROCESS_DETACH)
+	} else if (reason == DLL_PROCESS_DETACH) {
 		d11_log("process detach (%s) after %ld presents",
 			reserved ? "process exiting" : "FreeLibrary", g_present_n);
+		gh_shutdown();
+	}
 	return TRUE;
 }
 
@@ -3576,7 +4010,7 @@ static void gpuprobe_sink(const char *s)
 /* 0 software throughout, 1 the adapter presents the software frame, 2 the
  * adapter also draws it. Read once: the setting cannot change mid-session and
  * this is on the draw path. */
-static int gpu_mode(void)
+static int gpu_mode_knob(void)
 {
 	static int cached = -1;
 	char b[8];
@@ -3588,6 +4022,581 @@ static int gpu_mode(void)
 				 : 0;
 	return cached;
 }
+
+/* Latched once a frame at present, so a frame is either all host or all
+ * software; see rg_tick. */
+static int g_rg_live;
+
+/* D3D11SW_GPUHOST=2 is mode 3 with the adapter in another process: the draw
+ * path, readback and accounting below all key off this, and fall back to
+ * software the moment the host is not there. */
+static int gpu_mode(void)
+{
+	return g_rg_live ? 3 : gpu_mode_knob();
+}
+
+/* D3D11SW_GPUHOST=1: present through gpuhost64.exe, a separate process that
+ * owns the only GPU device. See gpuhost.h. Needs D3D11SW_GPU=0; the two are
+ * different answers to the same question and cannot share a window.
+ *
+ * Kept in plain globals: this module's image is held in the present across a
+ * restore, so a restore cannot bring back "host not started" and launch a
+ * second one onto a window the first still owns. If that ever changes, the
+ * mapping is found by name and reattached rather than recreated. */
+static struct {
+	int tried, dead, told_big;
+	HANDLE map, ev, proc;
+	GhHeader *h;
+	int back;
+	int32_t beat;
+	DWORD beat_tick, launch_tick;
+} g_gh;
+
+/* The renderer's side of the mode-2 draw ring. */
+static struct {
+	uint32_t head, signalled, next_id;
+	int32_t seq;
+	int release; /* D3D11SW_GPUHOST_RELEASE: let go of CPU texture copies */
+	unsigned draws, verts, uploads, frames, waits, readbacks;
+	unsigned long long bytes, up_bytes;
+} g_rg;
+
+/* 0 off, 1 present frames through the host, 2 draw on the host. */
+static int gh_mode(void)
+{
+	static int cached = -1;
+	char b[8];
+
+	if (cached < 0) {
+		unsigned n = savestate_getenv("D3D11SW_GPUHOST", b, sizeof(b));
+
+		cached = n && (b[0] == '1' || b[0] == '2') && gpu_mode_knob() == 0 ? b[0] - '0' : 0;
+		d11_log("gpuhost: %s (D3D11SW_GPUHOST=%s, D3D11SW_GPU=%d)",
+			cached == 2 ? "on, drawing on the GPU" : cached ? "on, presenting only" : "off",
+			n ? b : "unset", gpu_mode_knob());
+	}
+	return cached;
+}
+
+static int gh_on(void)
+{
+	return gh_mode() != 0;
+}
+
+static int gh_remote(void)
+{
+	return gh_mode() == 2;
+}
+
+static int gh_scale_is(const char *want)
+{
+	char b[32];
+	unsigned n = savestate_getenv("D3D11SW_SCALE", b, sizeof(b)), i, j;
+
+	for (i = 0; i < n; i++) {
+		for (j = 0; want[j] && i + j < n && (b[i + j] | 0x20) == want[j]; j++)
+			;
+		if (!want[j])
+			return 1;
+	}
+	return 0;
+}
+
+static void gh_fail(const char *why)
+{
+	DWORD code = 0;
+	int alive = g_gh.proc && WaitForSingleObject(g_gh.proc, 0) == WAIT_TIMEOUT;
+
+	if (g_gh.proc && !alive)
+		GetExitCodeProcess(g_gh.proc, &code);
+	g_gh.dead = 1;
+	g_rg_live = 0;
+	d11_log("gpuhost: %s - presenting with GDI from here on | %lu ms after launch, "
+		"host %s, heartbeat %ld, host pid %lu%s%s",
+		why, (unsigned long)(GetTickCount() - g_gh.launch_tick),
+		!g_gh.proc ? "never launched" : alive ? "still running" : "exited",
+		g_gh.h ? (long)g_gh.h->heartbeat : -1L, g_gh.h ? (unsigned long)g_gh.h->host_pid : 0ul,
+		g_gh.h && g_gh.h->msg[0] ? "; host said: " : "",
+		g_gh.h && g_gh.h->msg[0] ? g_gh.h->msg : "");
+	if (g_gh.proc && !alive)
+		d11_log("gpuhost: host exit code %#lx", (unsigned long)code);
+	if (g_gh.proc) {
+		/* A host that is still alive but not answering keeps its swap chain
+		 * on the window, which would hide every GDI frame behind it. */
+		if (WaitForSingleObject(g_gh.proc, 0) == WAIT_TIMEOUT)
+			TerminateProcess(g_gh.proc, 1);
+	}
+}
+
+static int gh_start(HWND hwnd, int w, int h)
+{
+	char name[64], evname[72], path[MAX_PATH], cmd[MAX_PATH + 96], *slash;
+	STARTUPINFOA si;
+	PROCESS_INFORMATION pi;
+	HMODULE self = NULL;
+	DWORD slot = ((DWORD)w * (DWORD)h * 4u + 0xffffu) & ~0xffffu;
+	DWORD slots_end = GH_HEADER_BYTES + GH_SLOTS * slot;
+	/* The readback area is a slot's size: it holds one backbuffer. */
+	DWORD total = slots_end + (gh_remote() ? GH_RING_BYTES + slot : 0);
+	int existed;
+
+	snprintf(name, sizeof(name), "Local\\rrsw_gpuhost_%lu", (unsigned long)GetCurrentProcessId());
+	snprintf(evname, sizeof(evname), "%s_f", name);
+	g_gh.map = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, total, name);
+	existed = GetLastError() == ERROR_ALREADY_EXISTS;
+	g_gh.h = g_gh.map ? (GhHeader *)MapViewOfFile(g_gh.map, FILE_MAP_ALL_ACCESS, 0, 0, 0) : NULL;
+	g_gh.ev = CreateEventA(NULL, FALSE, FALSE, evname);
+	if (!g_gh.h || !g_gh.ev) {
+		gh_fail("could not create the frame mapping");
+		return 0;
+	}
+	if (existed && g_gh.h->magic == GH_MAGIC && g_gh.h->state == GH_READY && g_gh.h->host_pid) {
+		g_gh.proc = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, g_gh.h->host_pid);
+		if (g_gh.proc && WaitForSingleObject(g_gh.proc, 0) == WAIT_TIMEOUT &&
+		    g_gh.h->mode == (uint32_t)(gh_remote() ? 2 : 0)) {
+			g_gh.back = g_gh.h->back;
+			g_rg.head = g_rg.signalled = g_gh.h->ring_head;
+			g_gh.beat = g_gh.h->heartbeat;
+			g_gh.beat_tick = g_gh.launch_tick = GetTickCount();
+			d11_log("gpuhost: reattached to host pid %lu", (unsigned long)g_gh.h->host_pid);
+			return 1;
+		}
+	}
+	memset(g_gh.h, 0, sizeof(*g_gh.h));
+	g_gh.h->version = GH_VERSION;
+	g_gh.h->header_bytes = GH_HEADER_BYTES;
+	g_gh.h->slot_bytes = slot;
+	g_gh.h->game_pid = GetCurrentProcessId();
+	g_gh.h->hwnd = (uint64_t)(uintptr_t)hwnd;
+	g_gh.h->middle = 1;
+	g_gh.h->point = !gh_scale_is("linear");
+	g_gh.h->integer = gh_scale_is("integer");
+	if (gh_remote()) {
+		char hp[8];
+
+		g_gh.h->mode = 2;
+		g_gh.h->ring_off = slots_end;
+		g_gh.h->ring_bytes = GH_RING_BYTES;
+		g_gh.h->rb_off = slots_end + GH_RING_BYTES;
+		g_gh.h->rb_bytes = slot;
+		g_gh.h->halfpixel = savestate_getenv("D3D11SW_GPU_HALFPIXEL", hp, sizeof(hp)) &&
+				    hp[0] == '1';
+	}
+	g_gh.back = 0;
+	MemoryBarrier();
+	g_gh.h->magic = GH_MAGIC;
+
+	if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			       (LPCSTR)(void *)gh_start, &self) ||
+	    !GetModuleFileNameA(self, path, sizeof(path)) || !(slash = strrchr(path, '\\'))) {
+		gh_fail("could not find our own folder");
+		return 0;
+	}
+	lstrcpynA(slash + 1, "gpuhost64.exe", (int)(sizeof(path) - (size_t)(slash + 1 - path)));
+	snprintf(cmd, sizeof(cmd), "\"%s\" %s %lu", path, name, (unsigned long)GetCurrentProcessId());
+	memset(&si, 0, sizeof(si));
+	si.cb = sizeof(si);
+	if (!CreateProcessA(path, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+		char why[MAX_PATH + 48];
+
+		snprintf(why, sizeof(why), "could not launch %s (error %lu)", path,
+			 (unsigned long)GetLastError());
+		gh_fail(why);
+		return 0;
+	}
+	CloseHandle(pi.hThread);
+	g_gh.proc = pi.hProcess;
+	g_gh.beat_tick = g_gh.launch_tick = GetTickCount();
+	d11_log("gpuhost: launched pid %lu for %dx%d frames, %u KB per slot, %s%s%s", pi.dwProcessId,
+		w, h, (unsigned)(slot / 1024), g_gh.h->point ? "point" : "linear",
+		g_gh.h->integer ? ", integer" : "",
+		gh_remote() ? ", with a 16 MB draw ring" : "");
+	return 1;
+}
+
+/* Liveness, shared by both modes. Returns 1 when the host is up and
+ * answering; a host found dead is failed here, once. */
+static int gh_check(void)
+{
+	GhHeader *hd = g_gh.h;
+	DWORD now = GetTickCount();
+
+	if (g_gh.dead || !hd || !g_gh.proc)
+		return 0;
+	if (WaitForSingleObject(g_gh.proc, 0) != WAIT_TIMEOUT) {
+		gh_fail("host process ended");
+		return 0;
+	}
+	if (hd->state == GH_FAILED) {
+		gh_fail("host failed");
+		return 0;
+	}
+	if (hd->heartbeat != g_gh.beat) {
+		g_gh.beat = hd->heartbeat;
+		g_gh.beat_tick = now;
+	} else if (now - g_gh.beat_tick > (hd->state == GH_READY ? 2000u : 15000u)) {
+		gh_fail(hd->state == GH_READY ? "host stopped answering" : "host never came up");
+		return 0;
+	}
+	return hd->state == GH_READY;
+}
+
+/* Returns 1 when the frame went to the host, 0 to let GDI present it. */
+static int gh_present(HWND hwnd, const uint32_t *px, int w, int h)
+{
+	GhHeader *hd;
+	uint32_t *dst;
+	int y;
+
+	if (g_gh.dead || !hwnd || w <= 0 || h <= 0)
+		return 0;
+	if (!g_gh.tried) {
+		g_gh.tried = 1;
+		if (!gh_start(hwnd, w, h))
+			return 0;
+	}
+	/* After the launch, which stamps beat_tick: checked before it, a tick
+	 * that lands inside CreateProcess makes now - beat_tick wrap to ~4e9 and
+	 * the host is declared dead the moment it is born. */
+	if (!gh_check())
+		return 0;
+	hd = g_gh.h;
+	if ((size_t)w * (size_t)h * 4u > hd->slot_bytes) {
+		if (!g_gh.told_big) {
+			g_gh.told_big = 1;
+			d11_log("gpuhost: %dx%d frame is larger than the %u-byte slots; those "
+				"frames go through GDI, which the host's swap chain will hide",
+				w, h, hd->slot_bytes);
+		}
+		return 0;
+	}
+	dst = GH_SLOT(hd, g_gh.back);
+	for (y = 0; y < h; y++)
+		memcpy(dst + (size_t)y * w, px + (size_t)y * w, (size_t)w * 4);
+	hd->slot_w[g_gh.back] = (uint32_t)w;
+	hd->slot_h[g_gh.back] = (uint32_t)h;
+	g_gh.back = (int)(InterlockedExchange((volatile LONG *)&hd->middle, g_gh.back | GH_FRESH) & 0xff);
+	hd->back = g_gh.back;
+	InterlockedIncrement((volatile LONG *)&hd->published);
+	SetEvent(g_gh.ev);
+	return 1;
+}
+
+static void gh_shutdown(void)
+{
+	if (g_gh.h && !g_gh.dead) {
+		g_gh.h->quit = 1;
+		if (g_gh.ev)
+			SetEvent(g_gh.ev);
+	}
+}
+
+/* --- mode 2: the gpu.c interface, carried to the host ---
+ *
+ * Same calls and the same answers as the in-process backend, so the mode-3
+ * code below runs unchanged; the macros after this block pick the remote one
+ * while the host is live. Nothing here waits on the host except a full ring
+ * and a readback, and a draw is accepted or declined on this side by the same
+ * rules gpu_draw applies, so there is no round trip per draw. */
+
+typedef struct RgTex {
+	uint32_t id;
+	int w, h;
+	unsigned gen;
+} RgTex;
+
+typedef char rg_tri_matches[sizeof(SwTri) == sizeof(GhTri) ? 1 : -1];
+
+/* Once a frame, at present: the frame about to start is drawn by whoever
+ * this says, start to finish. */
+static void rg_tick(void)
+{
+	static int told;
+	int live = g_gh.tried && gh_check();
+
+	if (live && !told) {
+		char b[8];
+
+		told = 1;
+		g_rg.release = savestate_getenv("D3D11SW_GPUHOST_RELEASE", b, sizeof(b)) &&
+			       b[0] == '1';
+		d11_log("gpuhost: host is up - backbuffer draws go to the GPU from the next "
+			"frame; CPU texture copies are %s",
+			g_rg.release ? "RELEASED once uploaded (D3D11SW_GPUHOST_RELEASE=1): "
+				       "no software fallback for them if the host dies"
+				     : "kept, so the software path can take over if the host dies");
+	}
+	g_rg_live = live;
+}
+
+static int rg_space(uint32_t need)
+{
+	GhHeader *h = g_gh.h;
+	DWORD t0 = 0;
+
+	while (h->ring_bytes - (g_rg.head - h->ring_tail) < need) {
+		SetEvent(g_gh.ev);
+		g_rg.signalled = g_rg.head;
+		if (!t0) {
+			t0 = GetTickCount();
+			g_rg.waits++;
+		}
+		if (!gh_check())
+			return 0;
+		if (GetTickCount() - t0 > 2000) {
+			gh_fail("draw ring stayed full for 2 s");
+			return 0;
+		}
+		Sleep(1);
+	}
+	return 1;
+}
+
+static void rg_write(const void *src, uint32_t n)
+{
+	uint8_t *ring = (uint8_t *)g_gh.h + g_gh.h->ring_off;
+	uint32_t at = g_rg.head & (g_gh.h->ring_bytes - 1), first = g_gh.h->ring_bytes - at;
+
+	if (first > n)
+		first = n;
+	memcpy(ring + at, src, first);
+	if (n > first)
+		memcpy(ring, (const uint8_t *)src + first, n - first);
+	g_rg.head += n;
+}
+
+static int rg_rec(uint32_t op, const void *a, uint32_t na, const void *b, uint32_t nb)
+{
+	GhRec rec;
+
+	rec.op = op;
+	rec.bytes = ((uint32_t)sizeof(rec) + na + nb + 7u) & ~7u;
+	if (!g_rg_live || !rg_space(rec.bytes))
+		return 0;
+	rg_write(&rec, sizeof(rec));
+	if (na)
+		rg_write(a, na);
+	if (nb)
+		rg_write(b, nb);
+	g_rg.head += rec.bytes - (uint32_t)sizeof(rec) - na - nb;
+	MemoryBarrier();
+	InterlockedExchange((volatile LONG *)&g_gh.h->ring_head, (LONG)g_rg.head);
+	g_rg.bytes += rec.bytes;
+	/* A loading burst is megabytes of uploads before the frame's end;
+	 * waking the host every megabyte lets it work through them alongside. */
+	if (g_rg.head - g_rg.signalled >= GH_CHUNK_BYTES) {
+		SetEvent(g_gh.ev);
+		g_rg.signalled = g_rg.head;
+	}
+	return 1;
+}
+
+static int rg_is_up(void)
+{
+	return g_rg_live;
+}
+
+static int rg_tex_sync(void **slot, const uint32_t *pixels, int w, int h, unsigned gen)
+{
+	RgTex *t;
+
+	if (!g_rg_live || !slot || !pixels || w <= 0 || h <= 0)
+		return 0;
+	t = (RgTex *)*slot;
+	if (!t) {
+		t = (RgTex *)calloc(1, sizeof(*t));
+		if (!t)
+			return 0;
+		t->id = ++g_rg.next_id;
+		*slot = t;
+	}
+	if (t->w != w || t->h != h) {
+		GhTexDef d;
+
+		d.id = t->id;
+		d.w = (uint32_t)w;
+		d.h = (uint32_t)h;
+		d.pad = 0;
+		if (!rg_rec(GH_OP_TEX_DEF, &d, sizeof(d), NULL, 0))
+			return 0;
+		t->w = w;
+		t->h = h;
+		t->gen = gen - 1;
+	}
+	if (t->gen != gen) {
+		uint32_t pitch = (uint32_t)w * 4u, per = GH_CHUNK_BYTES / pitch, y;
+
+		if (!per)
+			per = 1;
+		for (y = 0; y < (uint32_t)h; y += per) {
+			GhTexRows r;
+
+			r.id = t->id;
+			r.y0 = y;
+			r.rows = (uint32_t)h - y < per ? (uint32_t)h - y : per;
+			r.w = (uint32_t)w;
+			if (!rg_rec(GH_OP_TEX_ROWS, &r, sizeof(r), pixels + (size_t)y * w,
+				    r.rows * pitch))
+				return 0;
+		}
+		t->gen = gen;
+		g_rg.uploads++;
+		g_rg.up_bytes += (unsigned long long)pitch * (unsigned)h;
+	}
+	return 1;
+}
+
+static void rg_tex_drop(void **slot)
+{
+	RgTex *t = slot ? (RgTex *)*slot : NULL;
+
+	if (!t)
+		return;
+	if (g_rg_live) {
+		GhTexDrop d;
+
+		d.id = t->id;
+		d.pad = 0;
+		rg_rec(GH_OP_TEX_DROP, &d, sizeof(d), NULL, 0);
+	}
+	free(t);
+	*slot = NULL;
+}
+
+static int rg_frame_begin(int w, int h, int clear, uint32_t argb)
+{
+	GhFrameBegin f;
+
+	if (w <= 0 || h <= 0)
+		return 0;
+	f.w = (uint32_t)w;
+	f.h = (uint32_t)h;
+	f.clear = clear ? 1u : 0u;
+	f.argb = argb;
+	return rg_rec(GH_OP_FRAME_BEGIN, &f, sizeof(f), NULL, 0);
+}
+
+/* gpu_draw's acceptance, in D3D9 blend terms: SRCALPHA 5, INVSRCALPHA 6,
+ * ONE 2, ZERO 1, SRCCOLOR 3; ADD 1, REVSUBTRACT 3. -1 declines. */
+static int rg_blend_class(const SwState *st)
+{
+	int s = st->src_blend, d = st->dst_blend;
+
+	if (!st->blend_enable)
+		return GH_BLEND_OFF;
+	if (st->blend_op == 1) {
+		if (s == 5 && d == 6)
+			return GH_BLEND_OVER;
+		if (s == 5 && d == 2)
+			return GH_BLEND_ADD;
+		if (s == 1 && d == 3)
+			return GH_BLEND_MUL;
+		return -1;
+	}
+	if (st->blend_op == 3 && s == 5 && d == 2)
+		return GH_BLEND_RSUB;
+	return -1;
+}
+
+static int rg_draw(const SwTri *tris, int n, void *texslot, const SwState *st)
+{
+	RgTex *t = (RgTex *)texslot;
+	GhDraw d;
+	int bc;
+
+	if (!g_rg_live || !tris || n <= 0 || n * 3 > 16384 || !t)
+		return 0;
+	if (st->alpha_test && st->alpha_func != 0 && st->alpha_func != 6 && st->alpha_func != 7)
+		return 0;
+	bc = rg_blend_class(st);
+	if (bc < 0)
+		return 0;
+	memset(&d, 0, sizeof(d));
+	d.tex = t->id;
+	d.ntri = (uint32_t)n;
+	d.blend = (uint8_t)bc;
+	d.bilinear = st->bilinear ? 1 : 0;
+	d.mul_identity = st->mul_identity ? 1 : 0;
+	d.scissor = st->scissor_enable ? 1 : 0;
+	d.alpha_ref = st->alpha_test ? (float)st->alpha_ref / 255.0f : 0.0f;
+	d.sharpen = st->alpha_sharpen > 0 ? (float)st->alpha_sharpen / 256.0f : 0.0f;
+	d.sx0 = st->scissor_x0;
+	d.sy0 = st->scissor_y0;
+	d.sx1 = st->scissor_x1;
+	d.sy1 = st->scissor_y1;
+	if (!rg_rec(GH_OP_DRAW, &d, sizeof(d), tris, (uint32_t)n * (uint32_t)sizeof(SwTri)))
+		return 0;
+	g_rg.draws++;
+	g_rg.verts += (unsigned)n * 3u;
+	return 1;
+}
+
+static int rg_frame_end(void)
+{
+	if (!rg_rec(GH_OP_FRAME_END, NULL, 0, NULL, 0))
+		return 0;
+	SetEvent(g_gh.ev);
+	g_rg.signalled = g_rg.head;
+	g_rg.frames++;
+	return 1;
+}
+
+static int rg_readback(uint32_t *dst, unsigned dst_pitch, int w, int h)
+{
+	GhHeader *hd = g_gh.h;
+	GhReadback r;
+	DWORD t0;
+	int y;
+
+	if (!g_rg_live || !dst || w <= 0 || h <= 0 || (size_t)w * h * 4 > hd->rb_bytes)
+		return 0;
+	r.w = (uint32_t)w;
+	r.h = (uint32_t)h;
+	r.seq = ++g_rg.seq;
+	r.pad = 0;
+	if (!rg_rec(GH_OP_READBACK, &r, sizeof(r), NULL, 0))
+		return 0;
+	SetEvent(g_gh.ev);
+	g_rg.signalled = g_rg.head;
+	t0 = GetTickCount();
+	while (hd->rb_done != r.seq) {
+		if (!gh_check())
+			return 0;
+		if (GetTickCount() - t0 > 2000) {
+			gh_fail("readback not answered within 2 s");
+			return 0;
+		}
+		Sleep(0);
+	}
+	MemoryBarrier();
+	g_rg.readbacks++;
+	if (!hd->rb_ok)
+		return 0;
+	for (y = 0; y < h; y++)
+		memcpy((uint8_t *)dst + (size_t)y * dst_pitch,
+		       (const uint8_t *)hd + hd->rb_off + (size_t)y * w * 4, (size_t)w * 4);
+	return 1;
+}
+
+static void rg_prof_take(unsigned *uploads, unsigned *draws, unsigned *verts)
+{
+	*uploads = g_rg.uploads;
+	*draws = g_rg.draws;
+	*verts = g_rg.verts;
+	g_rg.uploads = g_rg.draws = g_rg.verts = 0;
+}
+
+#define gpu_is_up() (gh_remote() ? rg_is_up() : gpu_is_up())
+#define gpu_tex_sync(s, p, w, h, g) \
+	(gh_remote() ? rg_tex_sync(s, p, w, h, g) : gpu_tex_sync(s, p, w, h, g))
+#define gpu_tex_drop(s) (gh_remote() ? rg_tex_drop(s) : gpu_tex_drop(s))
+#define gpu_frame_begin(w, h, c, a) \
+	(gh_remote() ? rg_frame_begin(w, h, c, a) : gpu_frame_begin(w, h, c, a))
+#define gpu_draw(t, n, s, st) (gh_remote() ? rg_draw(t, n, s, st) : gpu_draw(t, n, s, st))
+#define gpu_frame_end() (gh_remote() ? rg_frame_end() : gpu_frame_end())
+#define gpu_readback(d, p, w, h) (gh_remote() ? rg_readback(d, p, w, h) : gpu_readback(d, p, w, h))
+#define gpu_prof_take(u, d, v) (gh_remote() ? rg_prof_take(u, d, v) : gpu_prof_take(u, d, v))
 
 /* Open while the adapter has a frame in progress. Cleared at present, so a
  * frame that never drew anything does not try to show itself. */
@@ -3659,6 +4668,10 @@ static void gpu_release_cpu_copy(Sw11Res *r)
 {
 	size_t bytes;
 
+	/* The host is a process that can die, and a texture whose only copy was
+	 * in it is gone with it. Kept unless asked, so the fallback is real. */
+	if (gh_remote() && !g_rg.release)
+		return;
 	if (!r || r->kind != 1 || r->gpu_released || r->gpu_no_release || !r->gtex)
 		return;
 	if (r->is_bb || (r->bind & D3D11_BIND_RENDER_TARGET))
@@ -3705,6 +4718,9 @@ static void gpu_sweep_release(void)
 {
 	Sw11Res *r;
 
+	/* Without releasing, sweeping only uploads what nobody is drawing. */
+	if (gh_remote() && !g_rg.release)
+		return;
 	if (!gpu_is_up())
 		return;
 	for (r = g_res_head; r; r = r->live_next) {
@@ -4596,9 +5612,21 @@ static int res_ensure_pixels(Sw11Res *r)
  * and painted back into a fresh arena slot the next time they are drawn. The game
  * holds a handle and never sees this - only the payload behind it moves. An evicted
  * texture IS a phantom with a bank. Fault-in and eviction run ONLY on the draw
- * thread, so no two allocations race the raster workers. LRU by a per-draw clock:
- * every texture used in a draw is stamped with the current clock, and eviction only
- * ever takes a strictly-older one, so nothing in flight is pulled from under a draw.
+ * thread, so no two allocations race the raster workers.
+ *
+ * Recency is by frame, not by draw. A per-draw clock only protected the draw in
+ * progress, so a scene slightly bigger than the window evicted a texture it had
+ * drawn a moment ago and painted it back on the next pass: eight textures went
+ * round in a cycle, #130 (15 MB) evicted so #131 could take its slot and painted
+ * back straight after, ~35 MB copied per cycle for nothing. Anything drawn in the
+ * last D3D11SW_FAUCET_HOT frames is never evicted; when nothing colder is left the
+ * window is overcommitted instead, which the arena absorbs (it is larger than any
+ * window worth running).
+ *
+ * Only arena-sized textures are managed. Below PAYLOAD_VA_MIN a payload comes from
+ * calloc, never touches the arena, frees almost nothing when evicted, and is often
+ * the most-drawn texture in the frame - so managed == arena-backed == evictable.
+ *
  * This is Step 1 - an in-RAM bank; a disk bank comes later. */
 static int faucet_on(void)
 {
@@ -4613,15 +5641,49 @@ static int faucet_on(void)
 	return cached;
 }
 
-static volatile LONG g_lru_clock;
+/* Frames a drawn texture stays protected from eviction. 1 protects only the
+ * current frame; the default covers a scene that alternates what it draws. */
+static unsigned faucet_hot_frames(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		char v[8];
+		unsigned n = savestate_getenv("D3D11SW_FAUCET_HOT", v, sizeof(v));
+		unsigned long k = n ? strtoul(v, NULL, 10) : 3;
+
+		cached = k ? (int)k : 1;
+	}
+	return (unsigned)cached;
+}
+
+/* A paint-in this soon after the same texture's eviction means the window evicted
+ * something the scene was still using. About a second at 60 fps. */
+#define FAUCET_THRASH_FRAMES 60u
+
+static int faucet_managed(const Sw11Res *r)
+{
+	return faucet_on() && pl_cappable(r, PL_TEXTURE) &&
+	       r->cpu_size >= PAYLOAD_VA_MIN;
+}
+
+static int faucet_hot(const Sw11Res *r)
+{
+	return (unsigned)g_present_n - r->lru < faucet_hot_frames();
+}
+
+/* Counters are touched only on the draw thread, which is also the one that reads
+ * them in perf_tick. */
 static volatile LONG g_faucet_in, g_faucet_evict, g_faucet_stuck;
+static LONG g_faucet_thrash, g_faucet_over;
+static LONG64 g_faucet_in_bytes, g_faucet_over_peak;
+static LONG64 g_faucet_hot_peak, g_faucet_hot_peak_all;
 
 /* Copy the current resident content to the bank, so it can be painted back after
  * eviction. Called when content is established (create with data, upload). */
 static void faucet_bank_store(Sw11Res *r)
 {
-	if (!faucet_on() || !r || !r->cpu || !r->cpu_size ||
-	    !pl_cappable(r, PL_TEXTURE))
+	if (!r || !r->cpu || !faucet_managed(r))
 		return;
 	if (r->bank_size != r->cpu_size) {
 		unsigned char *q = (unsigned char *)realloc(r->bank, r->cpu_size);
@@ -4634,8 +5696,8 @@ static void faucet_bank_store(Sw11Res *r)
 	memcpy(r->bank, r->cpu, r->cpu_size);
 }
 
-/* Free the arena copy of one least-recently-used resident texture, keeping its
- * bank and description. Returns bytes freed, 0 if nothing was evictable. */
+/* Free the arena copy of the least-recently-used cold texture, keeping its bank
+ * and description. Returns bytes freed, 0 if nothing was evictable. */
 static LONG64 faucet_evict_one(const Sw11Res *keep)
 {
 	Sw11Res *r, *victim = NULL;
@@ -4645,10 +5707,8 @@ static LONG64 faucet_evict_one(const Sw11Res *keep)
 	for (r = g_res_head; r; r = r->live_next) {
 		if (r == keep || r->kind != 1 || r->phantom || !r->cpu || !r->bank)
 			continue;
-		if (!pl_cappable(r, PL_TEXTURE))
+		if (!faucet_managed(r) || faucet_hot(r))
 			continue;
-		if (r->lru == (unsigned)g_lru_clock)
-			continue; /* used this draw - never pull it from under the draw */
 		if (!victim || r->lru < best) {
 			victim = r;
 			best = r->lru;
@@ -4668,19 +5728,57 @@ static LONG64 faucet_evict_one(const Sw11Res *keep)
 	victim->pixels_alias = 0;
 	victim->pixels_swizzled = 0;
 	victim->phantom = 1; /* evicted: a phantom with a bank behind it */
+	victim->evicted_at = (unsigned)g_present_n;
 	InterlockedIncrement(&g_faucet_evict);
 	return freed;
 }
 
+/* Overcommit is expected and soft: the scene's hot set is bigger than the window,
+ * so residency goes over it rather than evicting something still in use. Distinct
+ * from stuck, which is an allocation that actually failed. */
 static void faucet_ensure_room(size_t need, const Sw11Res *keep)
 {
 	unsigned cap = resident_cap_mb();
+	LONG64 win, over;
 
 	if (!cap)
 		return;
-	while ((LONG64)g_res_bytes + (LONG64)need > (LONG64)cap * 1024 * 1024)
+	win = (LONG64)cap * 1024 * 1024;
+	while ((LONG64)g_res_bytes + (LONG64)need > win)
 		if (!faucet_evict_one(keep))
 			break;
+	over = (LONG64)g_res_bytes + (LONG64)need - win;
+	if (over > 0) {
+		g_faucet_over++;
+		if (over > g_faucet_over_peak)
+			g_faucet_over_peak = over;
+	}
+}
+
+/* Stamp a texture as drawn this frame. */
+static void faucet_touch(Sw11Res *r)
+{
+	r->lru = (unsigned)g_present_n;
+}
+
+/* Per present: bytes of managed textures drawn in the hot span. Its peak is the
+ * window this scene needs to run without evicting anything it is using - the
+ * working-set figure the cap sweep could only bound from below. A walk of ~230
+ * entries a frame. */
+static void faucet_frame(void)
+{
+	Sw11Res *r;
+	LONG64 hot = 0;
+
+	if (!faucet_on())
+		return;
+	for (r = g_res_head; r; r = r->live_next)
+		if (r->kind == 1 && !r->phantom && faucet_managed(r) && faucet_hot(r))
+			hot += (LONG64)r->cpu_size;
+	if (hot > g_faucet_hot_peak)
+		g_faucet_hot_peak = hot;
+	if (hot > g_faucet_hot_peak_all)
+		g_faucet_hot_peak_all = hot;
 }
 
 /* Paint an evicted texture back from its bank into a fresh arena slot, so the draw
@@ -4699,12 +5797,23 @@ static int faucet_fault_in(Sw11Res *r)
 	r->phantom = 0;
 	r->cpu_dirty = 1;
 	res_account((LONG64)r->cpu_size, 0);
-	r->lru = (unsigned)g_lru_clock;
-	if (InterlockedIncrement(&g_faucet_in) <= 24)
-		d11_log("FAUCET paint-in #%d %ux%u -> arena %p (live %.1f MB, %ld evict(s) "
-			"so far)",
-			r->id, r->width, r->height, (void *)r->cpu,
-			g_res_bytes / (1024.0 * 1024.0), (long)g_faucet_evict);
+	faucet_touch(r);
+	g_faucet_in_bytes += (LONG64)r->cpu_size;
+	{
+		int thrash = r->evicted_at &&
+			     (unsigned)g_present_n - r->evicted_at <= FAUCET_THRASH_FRAMES;
+
+		if (thrash)
+			g_faucet_thrash++;
+		if (InterlockedIncrement(&g_faucet_in) <= 24)
+			d11_log("FAUCET paint-in #%d %ux%u -> %s %p (live %.1f MB, %ld "
+				"evict(s) so far)%s",
+				r->id, r->width, r->height,
+				arena_owns(r->cpu) ? "arena" : "outside the arena",
+				(void *)r->cpu, g_res_bytes / (1024.0 * 1024.0),
+				(long)g_faucet_evict,
+				thrash ? " - THRASH, evicted under a second ago" : "");
+	}
 	return 1;
 }
 
@@ -4713,7 +5822,7 @@ static int faucet_fault_in(Sw11Res *r)
  * resident plane for the upload to land in; either way it is banked afterward. */
 static void faucet_make_resident(Sw11Res *r)
 {
-	if (!faucet_on() || !r || !r->phantom || !pl_cappable(r, PL_TEXTURE))
+	if (!r || !r->phantom || !faucet_managed(r))
 		return;
 	if (r->bank) {
 		faucet_fault_in(r);
@@ -4724,8 +5833,9 @@ static void faucet_make_resident(Sw11Res *r)
 	if (r->cpu) {
 		r->phantom = 0;
 		res_account((LONG64)r->cpu_size, 0);
-		r->lru = (unsigned)g_lru_clock;
-	}
+		faucet_touch(r);
+	} else
+		InterlockedIncrement(&g_faucet_stuck);
 }
 
 static void res_copy_tex_rect(Sw11Res *d, UINT dx, UINT dy, Sw11Res *s, UINT sx, UINT sy,
@@ -4932,7 +6042,7 @@ static ULONG WINAPI Fact_Release(IDXGIFactory2 *this)
 	LONG n = InterlockedDecrement(&f->ref);
 	if (n == 0) {
 		priv_free(f->priv);
-		free(f);
+		obj_free(f);
 	}
 	return (ULONG)n;
 }
@@ -5104,7 +6214,7 @@ static ULONG WINAPI Adp_Release(IDXGIAdapter1 *this)
 	if (n == 0) {
 		if (a->factory)
 			a->factory->iface.lpVtbl->Release(&a->factory->iface);
-		free(a);
+		obj_free(a);
 	}
 	return (ULONG)n;
 }
@@ -5301,7 +6411,7 @@ static HRESULT WINAPI Adp_EnumOutputs(IDXGIAdapter1 *this, UINT i, IDXGIOutput *
 	d11_log("EnumOutputs %u -> %s", i, i < g_n_monitors ? "output" : "NOT_FOUND");
 	if (i >= g_n_monitors)
 		return DXGI_ERROR_NOT_FOUND;
-	o = (Sw11Output *)calloc(1, sizeof(*o));
+	o = (Sw11Output *)pin_calloc(sizeof(*o), "output", PK_SINGLE);
 	if (!o)
 		return E_OUTOFMEMORY;
 	ensure_vtbls();
@@ -5347,7 +6457,7 @@ static HRESULT WINAPI Adp_GetDesc1(IDXGIAdapter1 *this, DXGI_ADAPTER_DESC1 *d)
 
 static HRESULT Adp_create(Sw11Factory *f, IDXGIAdapter1 **out)
 {
-	Sw11Adapter *a = (Sw11Adapter *)calloc(1, sizeof(*a));
+	Sw11Adapter *a = (Sw11Adapter *)pin_calloc(sizeof(*a), "adapter", PK_SINGLE);
 	if (!a)
 		return E_OUTOFMEMORY;
 	ensure_vtbls();
@@ -5385,7 +6495,7 @@ static ULONG WINAPI Out_Release(IDXGIOutput *this)
 	if (n == 0) {
 		if (o->adapter)
 			o->adapter->iface.lpVtbl->Release(&o->adapter->iface);
-		free(o);
+		obj_free(o);
 	}
 	return (ULONG)n;
 }
@@ -5603,7 +6713,7 @@ HRESULT WINAPI CreateDXGIFactory2(UINT flags, REFIID riid, void **pp);
 
 static Sw11Factory *factory_new(void)
 {
-	Sw11Factory *f = (Sw11Factory *)calloc(1, sizeof(*f));
+	Sw11Factory *f = (Sw11Factory *)pin_calloc(sizeof(*f), "factory", PK_SINGLE);
 	if (!f)
 		return NULL;
 	ensure_vtbls();
@@ -6205,7 +7315,7 @@ static ULONG WINAPI Res_Release(Sw11Res *r)
 			}
 			return 0;
 		}
-		free(r);
+		obj_free(r);
 	}
 	return (ULONG)n;
 }
@@ -6386,7 +7496,7 @@ static ULONG WINAPI View_Release(void *this)
 	if (n == 0) {
 		if (v->res)
 			Res_Release(v->res);
-		free(v);
+		obj_free(v);
 	}
 	return (ULONG)n;
 }
@@ -6456,7 +7566,7 @@ static void WINAPI Dsv_GetDesc(ID3D11DepthStencilView *this, D3D11_DEPTH_STENCIL
 
 static Sw11View *view_new(Sw11Device *dev, Sw11Res *res, int kind, DXGI_FORMAT fmt)
 {
-	Sw11View *v = (Sw11View *)calloc(1, sizeof(*v));
+	Sw11View *v = (Sw11View *)pin_calloc(sizeof(*v), "view", PK_VIEW);
 	if (!v)
 		return NULL;
 	v->ref = 1;
@@ -6507,7 +7617,7 @@ static Sw11View *view_new(Sw11Device *dev, Sw11Res *res, int kind, DXGI_FORMAT f
 				InterlockedExchangeAdd(&g_retired_bytes, (LONG)sizeof(*o)); \
 				return 0;                                                   \
 			}                                                                   \
-			free(o);                                                           \
+			obj_free(o);                                                       \
 		}                                                                                   \
 		return (ULONG)n;                                                                   \
 	}                                                                                           \
@@ -6571,7 +7681,7 @@ static ULONG WINAPI Sh_Release(void *this)
 	LONG n = InterlockedDecrement(&s->ref);
 	if (n == 0) {
 		free(s->code);
-		free(s);
+		obj_free(s);
 	}
 	return (ULONG)n;
 }
@@ -6707,7 +7817,7 @@ static HRESULT create_tex2d(Sw11Device *dev, const D3D11_TEXTURE2D_DESC *desc,
 			tex_div = d;
 		}
 	}
-	r = (Sw11Res *)calloc(1, sizeof(*r));
+	r = (Sw11Res *)pin_calloc(sizeof(*r), "resource", PK_RES);
 	if (!r)
 		return E_OUTOFMEMORY;
 	r->virt_w = vw;
@@ -6725,7 +7835,7 @@ static HRESULT create_tex2d(Sw11Device *dev, const D3D11_TEXTURE2D_DESC *desc,
 	r->cpu_access = desc->CPUAccessFlags;
 	r->row_pitch = fmt_row_pitch(desc->Format, w);
 	r->cpu_size = fmt_size(desc->Format, w, h);
-	if (faucet_on() && pl_cappable(r, PL_TEXTURE)) {
+	if (faucet_managed(r)) {
 		/* Faucet: make window room by evicting cold textures, then allocate this
 		 * one resident. It is banked below once its content is in place, so it can
 		 * be evicted and painted back later. If it will not fit even after
@@ -6739,6 +7849,7 @@ static HRESULT create_tex2d(Sw11Device *dev, const D3D11_TEXTURE2D_DESC *desc,
 				res_account(-(LONG64)r->cpu_size, 0); /* stays live, 0 bytes */
 				r->phantom = 1;
 				phantom_init();
+				InterlockedIncrement(&g_faucet_stuck);
 			} else if (mark_empty() && (!init || !init->pSysMem) &&
 				   !fmt_bc_block(desc->Format) &&
 				   !fmt_is_depth(desc->Format) &&
@@ -6746,8 +7857,8 @@ static HRESULT create_tex2d(Sw11Device *dev, const D3D11_TEXTURE2D_DESC *desc,
 				fill_magenta(r->cpu, r->cpu_size);
 			}
 		}
-		r->lru = (unsigned)g_lru_clock;
-	} else if (phantom_capped(r)) {
+		faucet_touch(r);
+	} else if (!faucet_on() && phantom_capped(r)) {
 		/* Over the resident cap (cap-only mode, no faucet): a phantom. Keep the
 		 * full description, hold no pixels, count zero resident bytes. It renders
 		 * magenta, never crashes, and is exactly the faucet's evicted state. */
@@ -6772,7 +7883,7 @@ static HRESULT create_tex2d(Sw11Device *dev, const D3D11_TEXTURE2D_DESC *desc,
 			if (!r->cpu) {
 				log_oom("a texture", (LONG64)r->cpu_size);
 				res_account(-(LONG64)r->cpu_size, -1);
-				free(r);
+				obj_free(r);
 				return E_OUTOFMEMORY;
 			}
 			if (mark_empty() && (!init || !init->pSysMem) &&
@@ -6791,7 +7902,7 @@ static HRESULT create_tex2d(Sw11Device *dev, const D3D11_TEXTURE2D_DESC *desc,
 			 * and this path is reached precisely when memory is
 			 * scarce, so give back whatever it did manage. */
 			res_free_payload(r, 1);
-			free(r);
+			obj_free(r);
 			return E_OUTOFMEMORY;
 		}
 	}
@@ -6846,7 +7957,7 @@ static HRESULT create_buf(Sw11Device *dev, const D3D11_BUFFER_DESC *desc,
 	if (!desc || !out)
 		return E_INVALIDARG;
 	*out = NULL;
-	r = (Sw11Res *)calloc(1, sizeof(*r));
+	r = (Sw11Res *)pin_calloc(sizeof(*r), "resource", PK_RES);
 	if (!r)
 		return E_OUTOFMEMORY;
 	r->iface.buf.lpVtbl = &kBufVtbl;
@@ -6861,7 +7972,7 @@ static HRESULT create_buf(Sw11Device *dev, const D3D11_BUFFER_DESC *desc,
 	r->cpu = (unsigned char *)payload_alloc(desc->ByteWidth, r, PL_BUFFER);
 	if (!r->cpu) {
 		log_oom("a buffer", (LONG64)desc->ByteWidth);
-		free(r);
+		obj_free(r);
 		return E_OUTOFMEMORY;
 	}
 	res_account((LONG64)r->cpu_size, 1);
@@ -6872,9 +7983,313 @@ static HRESULT create_buf(Sw11Device *dev, const D3D11_BUFFER_DESC *desc,
 	return S_OK;
 }
 
+static int pin_rebuild_on(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		char buf[8];
+		unsigned n = savestate_getenv("D3D11SW_PIN_REBUILD", buf, sizeof(buf));
+
+		v = (n && buf[0] == '0') ? 0 : 1;
+	}
+	return v;
+}
+
+/* The pool object of this kind starting exactly at p, or NULL. */
+static void *pin_obj_at(const void *p, unsigned char kind)
+{
+	const unsigned char *b = (const unsigned char *)p;
+	unsigned i;
+
+	if (b < g_pin_mem || b >= g_pin_mem + sizeof(g_pin_mem) ||
+	    (size_t)(b - g_pin_mem) % PIN_UNIT)
+		return NULL;
+	i = (unsigned)((size_t)(b - g_pin_mem) / PIN_UNIT);
+	if (!g_pin_len[i] || g_pin_len[i] == 0xFFFF || g_pin_kind[i] != kind)
+		return NULL;
+	return (void *)p;
+}
+
+/* Clear every live run touching units [lo, hi). Whatever this launch had there
+ * is referenced only by memory the restore has just replaced, so it is dropped
+ * without releasing anything it holds; a resource is only unlinked so the
+ * census and the reap stop walking it. */
+static unsigned pin_evict(unsigned lo, unsigned hi)
+{
+	unsigned i = lo, n, gone = 0;
+
+	while (i > 0 && g_pin_len[i] == 0xFFFF)
+		i--;
+	while (i < hi) {
+		n = g_pin_len[i];
+		if (!n || n == 0xFFFF) {
+			i++;
+			continue;
+		}
+		if (g_pin_kind[i] == PK_RES) {
+			Sw11Res *r = (Sw11Res *)(g_pin_mem + (size_t)i * PIN_UNIT);
+
+			swrast_flush_if_pending(r->pixels);
+			swrast_flush_if_pending(r->depth);
+			res_list_remove(r);
+		}
+		obj_free(g_pin_mem + (size_t)i * PIN_UNIT);
+		gone++;
+		i += n;
+	}
+	return gone;
+}
+
+static void pin_place_next(unsigned i)
+{
+	g_pin_at_tid = GetCurrentThreadId();
+	g_pin_at = i + 1;
+}
+
+static int res_desc_same(const Sw11Res *t, const Sw11Res *l)
+{
+	return t->kind == l->kind && t->format == l->format && t->width == l->width &&
+	       t->height == l->height && t->virt_w == l->virt_w && t->virt_h == l->virt_h &&
+	       t->bind == l->bind && t->usage == l->usage && t->cpu_access == l->cpu_access &&
+	       t->byte_width == l->byte_width && t->is_bb == l->is_bb &&
+	       (!l->retired || t->retired);
+}
+
+/* After a load from another launch, make the pool hold what the save's pool
+ * held, address for address, because those are the addresses the restored game
+ * memory names. Descriptions and reference counts come from the save; pixel and
+ * buffer contents do not, so a rebuilt resource starts empty. */
+static void pin_rebuild(const unsigned short *sl, const unsigned char *sk,
+			const unsigned char *smem)
+{
+	unsigned i, res_same = 0, res_new = 0, res_fail = 0, res_bb = 0, view_same = 0,
+		    view_repoint = 0, view_new_n = 0, view_fail = 0, st_same = 0, st_new = 0,
+		    st_fail = 0, code_same = 0, code_diff = 0, code_gone = 0, evicted = 0,
+		    elsewhere = 0, logged = 0;
+	int pass;
+
+	if (!pin_rebuild_on()) {
+		d11_log("pin rebuild: off (D3D11SW_PIN_REBUILD=0)");
+		return;
+	}
+	for (pass = 0; pass < 3; pass++) {
+		for (i = 0; i < PIN_UNITS; i++) {
+			unsigned n = sl[i], k = sk[i];
+			const unsigned char *tb = smem + (size_t)i * PIN_UNIT;
+			unsigned char *lb = g_pin_mem + (size_t)i * PIN_UNIT;
+			int live_same = g_pin_len[i] == n && g_pin_kind[i] == k;
+
+			if (!n || n == 0xFFFF || k == PK_FREE || k == PK_SINGLE)
+				continue;
+			if (pass == 0 && k == PK_RES) {
+				const Sw11Res *t = (const Sw11Res *)tb;
+				Sw11Res *r = NULL;
+				HRESULT hr;
+
+				if (live_same && res_desc_same(t, (const Sw11Res *)lb)) {
+					((Sw11Res *)lb)->ref = t->retired ? 0 : t->ref;
+					res_same++;
+					continue;
+				}
+				if (t->is_bb) {
+					res_bb++;
+					continue;
+				}
+				if (!pin_obj_at(t->dev, PK_SINGLE)) {
+					res_fail++;
+					continue;
+				}
+				evicted += pin_evict(i, i + n);
+				pin_place_next(i);
+				if (t->kind == 1) {
+					D3D11_TEXTURE2D_DESC d;
+
+					memset(&d, 0, sizeof(d));
+					d.Width = t->virt_w ? t->virt_w : t->width;
+					d.Height = t->virt_h ? t->virt_h : t->height;
+					d.MipLevels = 1;
+					d.ArraySize = 1;
+					d.Format = t->format;
+					d.SampleDesc.Count = 1;
+					d.Usage = (D3D11_USAGE)t->usage;
+					d.BindFlags = t->bind;
+					d.CPUAccessFlags = t->cpu_access;
+					hr = create_tex2d(t->dev, &d, NULL, &r);
+				} else {
+					D3D11_BUFFER_DESC d;
+
+					memset(&d, 0, sizeof(d));
+					d.ByteWidth = t->byte_width;
+					d.Usage = (D3D11_USAGE)t->usage;
+					d.BindFlags = t->bind;
+					d.CPUAccessFlags = t->cpu_access;
+					hr = create_buf(t->dev, &d, NULL, &r);
+				}
+				g_pin_at = 0;
+				if (FAILED(hr) || !r) {
+					res_fail++;
+					continue;
+				}
+				if ((unsigned char *)r != lb) {
+					elsewhere++;
+					continue;
+				}
+				r->ref = t->ref;
+				if (t->retired) {
+					r->retired = 1;
+					r->ref = 0;
+				}
+				res_new++;
+				if (logged++ < 24)
+					d11_log("pin rebuild: %s #%d %ux%u fmt=%d bind=%#x at %p, ref %ld, "
+						"empty",
+						t->kind ? "texture" : "buffer", r->id,
+						t->kind ? (t->virt_w ? t->virt_w : t->width)
+							: t->byte_width,
+						t->kind ? (t->virt_h ? t->virt_h : t->height) : 1,
+						(int)t->format,
+						(unsigned)t->bind, lb, (long)r->ref);
+			} else if (pass == 1 && k == PK_VIEW) {
+				const Sw11View *t = (const Sw11View *)tb;
+				Sw11Res *res = (Sw11Res *)pin_obj_at(t->res, PK_RES);
+				Sw11View *v;
+
+				if (!res || !pin_obj_at(t->dev, PK_SINGLE)) {
+					view_fail++;
+					continue;
+				}
+				if (live_same) {
+					v = (Sw11View *)lb;
+					if (v->res != res)
+						view_repoint++;
+					else
+						view_same++;
+					v->res = res;
+					v->kind = t->kind;
+					v->format = t->format;
+					v->iface = t->iface;
+					v->ref = t->ref;
+					continue;
+				}
+				evicted += pin_evict(i, i + n);
+				res_ensure_pixels(res);
+				pin_place_next(i);
+				v = view_new(t->dev, res, t->kind, t->format);
+				g_pin_at = 0;
+				if (!v) {
+					view_fail++;
+					continue;
+				}
+				if ((unsigned char *)v != lb) {
+					elsewhere++;
+					continue;
+				}
+				InterlockedDecrement(&res->ref);
+				v->ref = t->ref;
+				view_new_n++;
+			} else if (pass == 2 && (k == PK_BLEND || k == PK_DS || k == PK_RAST ||
+						 k == PK_SAMP || k == PK_QUERY)) {
+				void *o;
+
+				if (live_same) {
+					memcpy(lb, tb, (size_t)n * PIN_UNIT);
+					st_same++;
+					continue;
+				}
+				evicted += pin_evict(i, i + n);
+				pin_place_next(i);
+				o = pin_calloc((size_t)n * PIN_UNIT, g_pk_name[k], (unsigned char)k);
+				g_pin_at = 0;
+				if (o != lb) {
+					if (o)
+						elsewhere++;
+					else
+						st_fail++;
+					continue;
+				}
+				memcpy(lb, tb, (size_t)n * PIN_UNIT);
+				st_new++;
+			} else if (pass == 2 && (k == PK_SHADER || k == PK_LAYOUT)) {
+				if (!live_same)
+					code_gone++;
+				else if (k == PK_SHADER
+						 ? (((const Sw11Shader *)tb)->is_ps !=
+							    ((const Sw11Shader *)lb)->is_ps ||
+						    ((const Sw11Shader *)tb)->bytes !=
+							    ((const Sw11Shader *)lb)->bytes)
+						 : ((const Sw11Layout *)tb)->n != ((const Sw11Layout *)lb)->n)
+					code_diff++;
+				else
+					code_same++;
+			}
+		}
+	}
+	for (i = 0; i < PIN_UNITS; i++) {
+		const Sw11Context *t = (const Sw11Context *)(smem + (size_t)i * PIN_UNIT);
+		Sw11Context *c = (Sw11Context *)(g_pin_mem + (size_t)i * PIN_UNIT);
+		unsigned dropped = 0, j;
+
+		if (sk[i] != PK_SINGLE || !sl[i] || sl[i] == 0xFFFF ||
+		    g_pin_kind[i] != PK_SINGLE || g_pin_len[i] != sl[i] ||
+		    t->iface.lpVtbl != &kCtxVtbl || c->iface.lpVtbl != &kCtxVtbl)
+			continue;
+		lock_dev(c->dev);
+		memcpy((unsigned char *)c + offsetof(Sw11Context, vb),
+		       (const unsigned char *)t + offsetof(Sw11Context, vb),
+		       sizeof(*c) - offsetof(Sw11Context, vb));
+#define PIN_KEEP(f, kind)                                    \
+	do {                                                 \
+		if ((f) && !pin_obj_at((f), (kind))) {       \
+			(f) = NULL;                          \
+			dropped++;                           \
+		}                                            \
+	} while (0)
+		for (j = 0; j < 16; j++) {
+			PIN_KEEP(c->vb[j], PK_RES);
+			PIN_KEEP(c->ps_srv[j], PK_VIEW);
+			PIN_KEEP(c->ps_samp[j], PK_SAMP);
+		}
+		for (j = 0; j < 14; j++) {
+			PIN_KEEP(c->cb_vs[j], PK_RES);
+			PIN_KEEP(c->cb_ps[j], PK_RES);
+		}
+		for (j = 0; j < 4; j++)
+			PIN_KEEP(c->rtv[j], PK_VIEW);
+		PIN_KEEP(c->ib, PK_RES);
+		PIN_KEEP(c->layout, PK_LAYOUT);
+		PIN_KEEP(c->vs, PK_SHADER);
+		PIN_KEEP(c->ps, PK_SHADER);
+		PIN_KEEP(c->dsv, PK_VIEW);
+		PIN_KEEP(c->blend, PK_BLEND);
+		PIN_KEEP(c->dss, PK_DS);
+		PIN_KEEP(c->rs, PK_RAST);
+#undef PIN_KEEP
+		unlock_dev(c->dev);
+		d11_log("pin rebuild: immediate context at %p given the save's bindings, %u "
+			"binding(s) cleared for pointing at nothing of the right kind",
+			c, dropped);
+	}
+	d11_log("pin rebuild: resources %u kept (same description), %u rebuilt empty, %u "
+		"failed, %u backbuffer(s) left alone",
+		res_same, res_new, res_fail, res_bb);
+	d11_log("pin rebuild: views %u kept, %u re-pointed at the save's resource, %u rebuilt, "
+		"%u failed (resource or device missing)",
+		view_same, view_repoint, view_new_n, view_fail);
+	d11_log("pin rebuild: state objects %u given the save's description, %u rebuilt, %u "
+		"failed",
+		st_same, st_new, st_fail);
+	d11_log("pin rebuild: shaders and layouts %u look the same, %u differ in size or stage, "
+		"%u missing and not rebuildable (their code is not in the save)",
+		code_same, code_diff, code_gone);
+	d11_log("pin rebuild: %u of this launch's object(s) evicted to make room, %u rebuilt "
+		"object(s) landed at the wrong address",
+		evicted, elsewhere);
+}
+
 static Sw11Shader *shader_new(Sw11Device *dev, const void *code, SIZE_T bytes, int is_ps)
 {
-	Sw11Shader *s = (Sw11Shader *)calloc(1, sizeof(*s));
+	Sw11Shader *s = (Sw11Shader *)pin_calloc(sizeof(*s), "shader", PK_SHADER);
 	if (!s)
 		return NULL;
 	s->iface.lpVtbl = is_ps ? (ID3D11VertexShaderVtbl *)&kPSVtbl : &kVSVtbl;
@@ -6885,7 +8300,7 @@ static Sw11Shader *shader_new(Sw11Device *dev, const void *code, SIZE_T bytes, i
 	if (bytes && code) {
 		s->code = (unsigned char *)malloc(bytes);
 		if (!s->code) {
-			free(s);
+			obj_free(s);
 			return NULL;
 		}
 		memcpy(s->code, code, bytes);
@@ -6925,7 +8340,7 @@ static ULONG WINAPI Swap_Release(IDXGISwapChain1 *this)
 		if (s->bb)
 			Res_Release(s->bb);
 		priv_free(s->priv);
-		free(s);
+		obj_free(s);
 	}
 	return (ULONG)n;
 }
@@ -6968,13 +8383,24 @@ static void perf_tick(void)
 	LARGE_INTEGER now;
 
 	if (!freq.QuadPart) {
+		/* D3D11SW_PAINTSTAT=1 measures every frame, N > 1 two frames in
+		 * every N. It costs raster time while measuring, so read the other
+		 * perf lines from a run without it. */
+		char buf[16];
+
+		if (savestate_getenv("D3D11SW_PAINTSTAT", buf, sizeof(buf)))
+			swrast_paintstat = atoi(buf);
 		QueryPerformanceFrequency(&freq);
 		QueryPerformanceCounter(&last);
-		d11_log("swrast: %d worker threads, cpu features %#x, simd %d",
-			swrast_thread_count(), swrast_cpu_features(), swrast_simd_enable);
+		d11_log("swrast: %d worker threads, cpu features %#x, simd %d, paintstat %d",
+			swrast_thread_count(), swrast_cpu_features(), swrast_simd_enable,
+			swrast_paintstat);
 	}
+	swrast_paintstat_frame();
 	frames++;
-	InterlockedIncrement(&g_present_n);
+	if (InterlockedIncrement(&g_present_n) % 120 == 1)
+		exp_transp_refresh();
+	faucet_frame();
 	QueryPerformanceCounter(&now);
 	if (now.QuadPart - last.QuadPart < freq.QuadPart * 2)
 		return;
@@ -7034,12 +8460,36 @@ static void perf_tick(void)
 					(double)g_arena.size / (1024.0 * 1024.0),
 					(unsigned)(uintptr_t)g_arena.base, g_arena.n,
 					g_arena.peak_ext, g_arena.fallbacks);
-			if (faucet_on())
-				d11_log("perf faucet: %ld paint-in(s), %ld evict(s), %ld stuck "
-					"(window too small) - resident %.1f MB of a %u MB window",
-					(long)g_faucet_in, (long)g_faucet_evict,
-					(long)g_faucet_stuck,
-					g_res_bytes / (1024.0 * 1024.0), resident_cap_mb());
+			if (faucet_on()) {
+				/* Per window, because totals cannot say whether the copying
+				 * was a load burst or is still going on. */
+				static LONG p_in, p_ev, p_th, p_ov, p_st;
+				static LONG64 p_bytes;
+				const double mb = 1024.0 * 1024.0;
+				LONG d_in = g_faucet_in - p_in, d_ev = g_faucet_evict - p_ev;
+				LONG d_th = g_faucet_thrash - p_th, d_ov = g_faucet_over - p_ov;
+				LONG d_st = g_faucet_stuck - p_st;
+				double d_mb = (double)(g_faucet_in_bytes - p_bytes) / mb;
+
+				d11_log("perf faucet: %ld paint-in(s) %.1f MB (%.2f MB/frame), "
+					"%ld evict(s), %ld thrash, %ld overcommit(s) (peak %.1f MB "
+					"over), %ld stuck | hot set %.1f MB peak this window, "
+					"%.1f MB peak ever (last %u frame(s)) | resident %.1f MB "
+					"of a %u MB window",
+					(long)d_in, d_mb, d_mb / f, (long)d_ev, (long)d_th,
+					(long)d_ov, (double)g_faucet_over_peak / mb, (long)d_st,
+					(double)g_faucet_hot_peak / mb,
+					(double)g_faucet_hot_peak_all / mb, faucet_hot_frames(),
+					g_res_bytes / mb, resident_cap_mb());
+				p_in = g_faucet_in;
+				p_ev = g_faucet_evict;
+				p_th = g_faucet_thrash;
+				p_ov = g_faucet_over;
+				p_st = g_faucet_stuck;
+				p_bytes = g_faucet_in_bytes;
+				g_faucet_hot_peak = 0;
+				g_faucet_over_peak = 0;
+			}
 		}
 		{
 			/* Reported next to memory because that is what makes a bin
@@ -7065,21 +8515,96 @@ static void perf_tick(void)
 				100 * mix[0] / area, 100 * mix[1] / area, 100 * mix[2] / area,
 				100 * mix[3] / area, 100 * mix[4] / area, 100 * mix[5] / area,
 				100 * mix[6] / area, 100 * mix[7] / area, 100 * mix[8] / area);
+		if (swrast_paintstat) {
+			/* What share of the shaded area changes nothing, split by the
+			 * trick that would skip it. Per measured frame, since the
+			 * sampling mode leaves most frames unmeasured. */
+			double p[SWPS_N], mf, sh;
+
+			swrast_prof_paint(p);
+			mf = p[SWPS_FRAMES] > 0.0 ? p[SWPS_FRAMES] : 1.0;
+			sh = p[SWPS_SHADED] > 0.0 ? p[SWPS_SHADED] : 1.0;
+			if (p[SWPS_FRAMES] > 0.0) {
+				d11_log("perf paint (%.0f of %u frame(s) measured): shaded %.2f "
+					"Mpx/frame | killed %.1f%% zero-alpha %.1f%% no-op %.1f%% "
+					"opaque %.1f%% blended %.1f%% | hidden %.1f%% (%.2f "
+					"Mpx/frame buried under a later opaque write) | uniform "
+					"8-runs %.1f%% of %.2f Mpx/frame full vector groups "
+					"(clear %.1f%% opaque %.1f%% translucent %.1f%%) (vector "
+					"%.0f%% of shaded)",
+					p[SWPS_FRAMES], frames, p[SWPS_SHADED] / mf / 1e6,
+					100 * p[SWPS_KILLED] / sh, 100 * p[SWPS_ZERO] / sh,
+					100 * p[SWPS_NOOP] / sh, 100 * p[SWPS_OPAQUE] / sh,
+					100 * p[SWPS_RMW] / sh, 100 * p[SWPS_HIDDEN] / sh,
+					p[SWPS_HIDDEN] / mf / 1e6,
+					p[SWPS_FULL8] > 0.0 ? 100 * p[SWPS_UNIFORM] / p[SWPS_FULL8]
+							    : 0.0,
+					p[SWPS_FULL8] / mf / 1e6,
+					p[SWPS_FULL8] > 0.0 ? 100 * p[SWPS_UNIF_CLEAR] / p[SWPS_FULL8]
+							    : 0.0,
+					p[SWPS_FULL8] > 0.0 ? 100 * p[SWPS_UNIF_OPAQUE] / p[SWPS_FULL8]
+							    : 0.0,
+					p[SWPS_FULL8] > 0.0
+						? 100 *
+							  (p[SWPS_UNIFORM] - p[SWPS_UNIF_CLEAR] -
+							   p[SWPS_UNIF_OPAQUE]) /
+							  p[SWPS_FULL8]
+						: 0.0,
+					100 * p[SWPS_VEC] / sh);
+				d11_log("perf paint reuse: %.0f%% of touched tiles (%.0f%% of their "
+					"%.2f Mpx/frame) drew exactly what they drew last frame | "
+					"%.0f of %.0f target-frame(s) fully unchanged | quads "
+					"%.2f Mpx/frame: 1:1 %.2f, integer upscale %.2f, "
+					"whole-target %.2f (%.1f/frame)",
+					p[SWPS_TILES] > 0.0 ? 100 * p[SWPS_TILES_SAME] / p[SWPS_TILES]
+							    : 0.0,
+					p[SWPS_TILE_PX] > 0.0
+						? 100 * p[SWPS_TILE_PX_SAME] / p[SWPS_TILE_PX]
+						: 0.0,
+					p[SWPS_TILE_PX] / mf / 1e6, p[SWPS_TGT_STATIC],
+					p[SWPS_TGT_FRAMES], p[SWPS_RECT] / mf / 1e6,
+					p[SWPS_RECT_1TO1] / mf / 1e6, p[SWPS_RECT_INT] / mf / 1e6,
+					p[SWPS_RECT_FULL] / mf / 1e6, p[SWPS_RECT_FULL_N] / mf);
+			}
+			/* Weighted by screen area drawn from each texture, not by
+			 * texture count, and over the whole window. */
+			if (g_pal[PAL_PX] > 0.0) {
+				double tp = g_pal[PAL_PX];
+				double cp = tp - g_pal[PAL_PX_RT] - g_pal[PAL_PX_NONE];
+				double c = cp > 0.0 ? 100.0 / cp : 0.0;
+				double sb = g_pal[PAL_SOLID] + g_pal[PAL_CLEAR];
+
+				d11_log("perf paint colour: of %.2f Mpx/frame textured, %.0f%% from "
+					"render targets and %.0f%% not yet taken | the rest by "
+					"source palette: <=2 %.0f%%, <=16 %.0f%%, <=256 %.0f%%, "
+					">256 %.0f%% | 4x4 blocks clear %.0f%% solid %.0f%% (white "
+					"%.1f%% black %.1f%%) mixed %.0f%% | %.0f%% of solid "
+					"blocks start a run | mean texel run %.1f",
+					tp / f / 1e6, 100 * g_pal[PAL_PX_RT] / tp,
+					100 * g_pal[PAL_PX_NONE] / tp, c * g_pal[PAL_C2],
+					c * g_pal[PAL_C16], c * g_pal[PAL_C256], c * g_pal[PAL_CMANY],
+					c * g_pal[PAL_CLEAR], c * g_pal[PAL_SOLID], c * g_pal[PAL_WHITE],
+					c * g_pal[PAL_BLACK], 100.0 - c * sb,
+					sb > 0.0 ? 100 * g_pal[PAL_RUNS] / sb : 0.0,
+					g_pal[PAL_TEXRUN] > 0.0 ? cp / g_pal[PAL_TEXRUN] : 0.0);
+			}
+			memset(g_pal, 0, sizeof(g_pal));
+		}
 		{
-			double sr[10], tot = 0;
-			for (i = 0; i < 10; i++)
+			double sr[11], tot = 0;
+			for (i = 0; i < 11; i++)
 				sr[i] = 0;
-			swrast_prof_simd(sr, 10);
+			swrast_prof_simd(sr, 11);
 			for (i = 0; i < 10; i++)
 				tot += sr[i];
 			if (tot > 0.0)
-				d11_log("perf simd%% ok=%.0f | noavx2=%.0f notex=%.0f notflat=%.0f "
-					"depth=%.0f mask=%.0f blend=%.0f npot=%.0f addr=%.0f "
-					"other=%.0f",
-					100 * sr[0] / tot, 100 * sr[1] / tot, 100 * sr[2] / tot,
-					100 * sr[3] / tot, 100 * sr[4] / tot, 100 * sr[5] / tot,
-					100 * sr[6] / tot, 100 * sr[7] / tot, 100 * sr[8] / tot,
-					100 * sr[9] / tot);
+				d11_log("perf simd%% ok=%.0f (wrap/mirror fold %.0f) | noavx2=%.0f "
+					"notex=%.0f notflat=%.0f depth=%.0f mask=%.0f blend=%.0f "
+					"npot=%.0f addr=%.0f other=%.0f",
+					100 * sr[0] / tot, 100 * sr[10] / tot, 100 * sr[1] / tot,
+					100 * sr[2] / tot, 100 * sr[3] / tot, 100 * sr[4] / tot,
+					100 * sr[5] / tot, 100 * sr[6] / tot, 100 * sr[7] / tot,
+					100 * sr[8] / tot, 100 * sr[9] / tot);
 			/* The percentage above is the bill; this is the itemisation.
 			 * Scalar pixels cost about six times what vector ones do, so
 			 * whatever tops this list is the frame time. */
@@ -7172,6 +8697,38 @@ static void perf_tick(void)
 					f > 0.0 ? (double)g_pace_calls / f : 0.0,
 					(pa - g_pace_dwm * ms) / f, g_pace_hz, g_pace_target,
 					g_pace_late, g_pace_resets);
+			if (g_gh.h && !g_gh.dead) {
+				static int32_t pub0, shown0;
+				int32_t pub = g_gh.h->published, shown = g_gh.h->shown;
+
+				d11_log("perf gpuhost: %s, %ld frame(s) handed over, %ld shown%s",
+					g_gh.h->state == GH_READY ? "presenting" : "starting",
+					(long)(pub - pub0), (long)(shown - shown0),
+					g_gh.h->shader_user ? ", gpuhost.hlsl" : ", built-in shader");
+				pub0 = pub;
+				shown0 = shown;
+				if (gh_remote()) {
+					static unsigned long long by0, up0;
+					static unsigned fr0, wt0;
+					unsigned fr = g_rg.frames - fr0;
+
+					d11_log("perf gpuhost draw: %u GPU frame(s), %.0f KB/frame "
+						"through the ring, %.1f MB of texture uploads, %u "
+						"stall(s) on a full ring, %ld draw(s) and %ld "
+						"texture(s) on the host so far, %u readback(s)",
+						fr,
+						fr ? (double)(g_rg.bytes - by0 - (g_rg.up_bytes - up0)) /
+							     1024.0 / fr
+						   : 0.0,
+						(double)(g_rg.up_bytes - up0) / (1024.0 * 1024.0),
+						g_rg.waits - wt0, (long)g_gh.h->gpu_draws,
+						(long)g_gh.h->gpu_textures, g_rg.readbacks);
+					by0 = g_rg.bytes;
+					up0 = g_rg.up_bytes;
+					fr0 = g_rg.frames;
+					wt0 = g_rg.waits;
+				}
+			}
 			memset(g_zone, 0, sizeof(g_zone));
 			g_pace_dwm = 0.0;
 			g_pace_calls = g_pace_resets = g_pace_late = 0;
@@ -7231,11 +8788,29 @@ static void perf_tick(void)
 				g_perf_tex[best] = tmp;
 			}
 		}
-		for (i = 0; i < g_perf_ntex && i < 6; i++)
-			d11_log("perf tex #%d %dx%d blend=%04x %.2f Mpx/frame %.0f draws/frame",
+		for (i = 0; i < g_perf_ntex && i < 6; i++) {
+			const TexPal *t = &g_perf_tex[i].pal;
+			char pal[160] = "";
+
+			if (t->gen && t->blocks) {
+				double b = 100.0 / (double)t->blocks;
+				unsigned sb = t->solid + t->clear;
+
+				snprintf(pal, sizeof(pal),
+					 " | %s%u colour(s), 4x4 clear %.0f%% solid %.0f%% (white "
+					 "%.0f%% black %.0f%%), %.0f%% of solid blocks start a run, "
+					 "texel run %.1f",
+					 t->colors > 256 ? ">" : "", t->colors > 256 ? 256u : t->colors,
+					 b * t->clear, b * t->solid, b * t->white, b * t->black,
+					 sb ? 100.0 * t->runs / (double)sb : 0.0,
+					 t->texel_runs ? (double)t->texels / (double)t->texel_runs
+						       : 0.0);
+			}
+			d11_log("perf tex #%d %dx%d blend=%04x %.2f Mpx/frame %.0f draws/frame%s",
 				g_perf_tex[i].id, g_perf_tex[i].w, g_perf_tex[i].h,
 				(unsigned)g_perf_tex[i].blend, g_perf_tex[i].px / f / 1e6,
-				g_perf_tex[i].draws / f);
+				g_perf_tex[i].draws / f, pal);
+		}
 		g_perf_ntex = 0;
 		memset(g_perf_tex, 0, sizeof(g_perf_tex));
 		g_perf_nrt = 0;
@@ -7712,6 +9287,8 @@ static HRESULT WINAPI Swap_Present(IDXGISwapChain1 *this, UINT sync, UINT flags)
 		else
 			continue;
 		ledger_register();
+		if (!want_load)
+			pin_map_write(k);
 		if (want_load) {
 			if (savestate_load(k)) {
 				ledger_reap();
@@ -7726,7 +9303,16 @@ static HRESULT WINAPI Swap_Present(IDXGISwapChain1 *this, UINT sync, UINT flags)
 			 * line was then read as the process having died on the way out
 			 * of one. */
 			if (savestate_last_was_restore()) {
+				/* Once one load came from another launch, the pool holds that
+				 * launch's layout, and a later load of a slot from this one
+				 * names this one's. Either way the pool has to be made to
+				 * match the slot, after the reap so it cannot free what the
+				 * rebuild creates. */
+				if (savestate_last_load_foreign())
+					g_pin_foreign_seen = 1;
 				ledger_reap();
+				if (g_pin_foreign_seen)
+					pin_map_compare(k);
 				/* Behavior: recreate GPU DXGI from the live HWND.
 				 * Software swapchain COM lives on the held wrapper
 				 * heap; real adapter COM must not be memcpy'd. */
@@ -7876,8 +9462,16 @@ static HRESULT WINAPI Swap_Present(IDXGISwapChain1 *this, UINT sync, UINT flags)
 			/* Here because this is the first place the window is
 			 * reachable. It costs the first frame's draws, which no one
 			 * will see. */
-			if (gpu_mode() >= 2)
+			if (!gh_remote() && gpu_mode() >= 2)
 				gpu_ensure(s->hwnd);
+			{
+				static int gh_hooked;
+
+				if (!gh_hooked && gh_on()) {
+					gh_hooked = 1;
+					swrast_set_gpu_present(gh_present);
+				}
+			}
 			/* Once a frame, after the draws: a texture loaded during
 			 * this frame is then moved before the next one, and the
 			 * game's own loading pauses are where most of them arrive. */
@@ -7891,6 +9485,8 @@ static HRESULT WINAPI Swap_Present(IDXGISwapChain1 *this, UINT sync, UINT flags)
 			} else {
 				swrast_present(&r, s->hwnd);
 			}
+			if (gh_remote())
+				rg_tick();
 			QueryPerformanceCounter(&b);
 			g_zone[ZONE_PRESENT] += b.QuadPart - a.QuadPart;
 			g_raster_nested_ms += swrast_prof_peek_raster() - r0;
@@ -8174,7 +9770,7 @@ static HRESULT sw11_create_swap(Sw11Device *dev, HWND hwnd, const DXGI_SWAP_CHAI
 	HRESULT hr;
 	UINT w, h, vw, vh;
 	*out = NULL;
-	s = (Sw11Swap *)calloc(1, sizeof(*s));
+	s = (Sw11Swap *)pin_calloc(sizeof(*s), "swap chain", PK_SINGLE);
 	if (!s)
 		return E_OUTOFMEMORY;
 	s->iface.lpVtbl = &kSwapVtbl;
@@ -8216,7 +9812,7 @@ static HRESULT sw11_create_swap(Sw11Device *dev, HWND hwnd, const DXGI_SWAP_CHAI
 	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 	hr = create_tex2d(dev, &td, NULL, &s->bb);
 	if (FAILED(hr)) {
-		free(s);
+		obj_free(s);
 		return hr;
 	}
 	s->bb->is_bb = 1;
@@ -8273,7 +9869,7 @@ static ULONG WINAPI Dev_Release(ID3D11Device1 *this)
 			d->factory->iface.lpVtbl->Release(&d->factory->iface);
 		priv_free(d->priv);
 		DeleteCriticalSection(&d->lock);
-		free(d);
+		obj_free(d);
 	}
 	return (ULONG)n;
 }
@@ -8444,7 +10040,7 @@ static HRESULT WINAPI Dev_CreateInputLayout(ID3D11Device1 *this,
 	if (!out)
 		return E_POINTER;
 	*out = NULL;
-	l = (Sw11Layout *)calloc(1, sizeof(*l));
+	l = (Sw11Layout *)pin_calloc(sizeof(*l), "layout", PK_LAYOUT);
 	if (!l)
 		return E_OUTOFMEMORY;
 	l->iface.lpVtbl = &kLayVtbl;
@@ -8453,7 +10049,7 @@ static HRESULT WINAPI Dev_CreateInputLayout(ID3D11Device1 *this,
 	l->n = n;
 	l->elems = (D3D11_INPUT_ELEMENT_DESC *)calloc(n ? n : 1, sizeof(*l->elems));
 	if (!l->elems) {
-		free(l);
+		obj_free(l);
 		return E_OUTOFMEMORY;
 	}
 	memset(off, 0, sizeof(off));
@@ -8594,7 +10190,7 @@ static HRESULT WINAPI Dev_CreateBlendState(ID3D11Device1 *this, const D3D11_BLEN
 	if (!out)
 		return E_POINTER;
 	*out = NULL;
-	o = (Sw11Blend *)calloc(1, sizeof(*o));
+	o = (Sw11Blend *)pin_calloc(sizeof(*o), "blend", PK_BLEND);
 	if (!o)
 		return E_OUTOFMEMORY;
 	o->iface.lpVtbl = &kBlendVtbl;
@@ -8613,7 +10209,7 @@ static HRESULT WINAPI Dev_CreateDSS(ID3D11Device1 *this, const D3D11_DEPTH_STENC
 	if (!out)
 		return E_POINTER;
 	*out = NULL;
-	o = (Sw11DS *)calloc(1, sizeof(*o));
+	o = (Sw11DS *)pin_calloc(sizeof(*o), "depth-stencil", PK_DS);
 	if (!o)
 		return E_OUTOFMEMORY;
 	o->iface.lpVtbl = &kDSVtbl;
@@ -8654,7 +10250,7 @@ static HRESULT WINAPI Dev_CreateRS(ID3D11Device1 *this, const D3D11_RASTERIZER_D
 	if (!out)
 		return E_POINTER;
 	*out = NULL;
-	o = (Sw11Rast *)calloc(1, sizeof(*o));
+	o = (Sw11Rast *)pin_calloc(sizeof(*o), "raster", PK_RAST);
 	if (!o)
 		return E_OUTOFMEMORY;
 	o->iface.lpVtbl = &kRastVtbl;
@@ -8673,7 +10269,7 @@ static HRESULT WINAPI Dev_CreateSampler(ID3D11Device1 *this, const D3D11_SAMPLER
 	if (!out)
 		return E_POINTER;
 	*out = NULL;
-	o = (Sw11Samp *)calloc(1, sizeof(*o));
+	o = (Sw11Samp *)pin_calloc(sizeof(*o), "sampler", PK_SAMP);
 	if (!o)
 		return E_OUTOFMEMORY;
 	o->iface.lpVtbl = &kSampVtbl;
@@ -8692,7 +10288,7 @@ static HRESULT WINAPI Dev_CreateQuery(ID3D11Device1 *this, const D3D11_QUERY_DES
 	if (!out)
 		return E_POINTER;
 	*out = NULL;
-	o = (Sw11Query *)calloc(1, sizeof(*o));
+	o = (Sw11Query *)pin_calloc(sizeof(*o), "query", PK_QUERY);
 	if (!o)
 		return E_OUTOFMEMORY;
 	o->iface.lpVtbl = &kQueryVtbl;
@@ -9076,7 +10672,7 @@ static ULONG WINAPI Ctx_Release(ID3D11DeviceContext1 *this)
 	Sw11Context *c = (Sw11Context *)this;
 	LONG n = InterlockedDecrement(&c->ref);
 	if (n == 0)
-		free(c);
+		obj_free(c);
 	return (ULONG)n;
 }
 static void WINAPI Ctx_GetDevice(ID3D11DeviceContext1 *this, ID3D11Device **out)
@@ -10505,6 +12101,10 @@ static void ctx_draw_inner(Sw11Context *c, UINT count, UINT start, INT base, int
 			break;
 		}
 	}
+	if (g_exp_transp == 1 && st.blend_enable)
+		return;
+	if (g_exp_transp == 2)
+		st.blend_enable = 0;
 	st.z_enable = 0;
 	if (c->dss && c->dss->desc.DepthEnable && rast.depth) {
 		st.z_enable = 1;
@@ -10559,11 +12159,6 @@ static void ctx_draw_inner(Sw11Context *c, UINT count, UINT start, INT base, int
 	{
 		int si;
 		a8_font = 0;
-		/* One tick per draw, so every texture used here shares this stamp and
-		 * eviction (which only takes strictly-older ones) can never pull a texture
-		 * out from under the draw that is using it. Draw thread only. */
-		if (faucet_on())
-			InterlockedIncrement(&g_lru_clock);
 		for (si = 0; si < 4; si++) {
 			/* Faucet: an evicted (phantom-with-bank) texture is painted back into
 			 * the arena here, on the draw thread, before it is sampled. If it fits
@@ -10590,7 +12185,8 @@ static void ctx_draw_inner(Sw11Context *c, UINT count, UINT start, INT base, int
 			    c->ps_srv[si]->res->pixels) {
 				Sw11Res *tr = c->ps_srv[si]->res;
 
-				tr->lru = (unsigned)g_lru_clock; /* mark used this draw */
+				faucet_touch(tr);
+				pal_maybe_take(tr);
 				int a8 = (tr->format == DXGI_FORMAT_A8_UNORM ||
 					   tr->format == DXGI_FORMAT_R8_UNORM ||
 					   tr->format == DXGI_FORMAT_R8_UINT);
@@ -10613,6 +12209,7 @@ static void ctx_draw_inner(Sw11Context *c, UINT count, UINT start, INT base, int
 				tex.pixels = tr->pixels;
 				tex.width = (int)tr->width;
 				tex.height = (int)tr->height;
+				tex.gen = tr->gpu_gen;
 				src_res = tr;
 				st.bilinear = 1;
 				st.addr_u = D3DTADDRESS_CLAMP;
@@ -11110,8 +12707,7 @@ static void ctx_draw_inner(Sw11Context *c, UINT count, UINT start, INT base, int
 			}
 			census_draw(rt, batch, (int)ntri, src_res, &st);
 		frame_note_draw(rt, ntri);
-			perf_note_area(rt, batch, ntri, src_res ? src_res->id : -1, tex.width,
-				       tex.height,
+			perf_note_area(rt, batch, ntri, src_res, tex.width, tex.height,
 				       st.blend_enable ? (st.src_blend | (st.dst_blend << 8)) : 0);
 			if (rt->is_bb)
 				g_bb_writes += ntri;
@@ -11140,7 +12736,8 @@ static void ctx_draw_inner(Sw11Context *c, UINT count, UINT start, INT base, int
 
 static Sw11Context *ctx_new(Sw11Device *dev, int deferred)
 {
-	Sw11Context *c = (Sw11Context *)calloc(1, sizeof(*c));
+	Sw11Context *c = deferred ? (Sw11Context *)calloc(1, sizeof(*c))
+				  : (Sw11Context *)pin_calloc(sizeof(*c), "immediate context", PK_SINGLE);
 	if (!c)
 		return NULL;
 	c->iface.lpVtbl = &kCtxVtbl;
@@ -11160,7 +12757,7 @@ static HRESULT sw11_create_device(IDXGIAdapter *adapter, UINT flags, D3D_FEATURE
 	Sw11Adapter *a = NULL;
 	ensure_vtbls();
 	*out = NULL;
-	d = (Sw11Device *)calloc(1, sizeof(*d));
+	d = (Sw11Device *)pin_calloc(sizeof(*d), "device", PK_SINGLE);
 	if (!d)
 		return E_OUTOFMEMORY;
 	d->iface.lpVtbl = &kDevVtbl;
@@ -11187,12 +12784,12 @@ static HRESULT sw11_create_device(IDXGIAdapter *adapter, UINT flags, D3D_FEATURE
 	if (!f) {
 		f = factory_new();
 		if (!f) {
-			free(d);
+			obj_free(d);
 			return E_OUTOFMEMORY;
 		}
 		if (FAILED(Adp_create(f, (IDXGIAdapter1 **)&a))) {
 			f->iface.lpVtbl->Release(&f->iface);
-			free(d);
+			obj_free(d);
 			return E_OUTOFMEMORY;
 		}
 	}

@@ -35,6 +35,19 @@ double savestate_last_mb(void);
  * snapshot resumes inside the save it was taking and returns through it, so a
  * successful restore arrives back in the caller's save branch. */
 int savestate_last_was_restore(void);
+/* Nonzero if the most recent load wrote back a slot saved by another process.
+ * Per-process bookkeeping - lists of what this process created since the save -
+ * describes a process that the restored memory knows nothing about. */
+int savestate_last_load_foreign(void);
+
+/* Memory we hold in the present whose contents are nonetheless made to match
+ * the save after a load from another process - the renderer's object pool. A
+ * game global pointing into it keeps its saved value. */
+void savestate_follow_save_range(const void *base, size_t bytes);
+
+/* After a load: 1 if p lies in a region the load wrote, 0 if in one it saved
+ * but left in the present, -1 if the slot never held it or nothing was loaded. */
+int savestate_addr_restored(const void *p);
 /* Walks every heap's block headers and logs what is in them, comparing against
  * the session's first census. Observation only - it neither saves nor restores,
  * and that is what makes it able to take the heap's lock safely. Take one before
@@ -56,6 +69,14 @@ double savestate_live_ms(void);
  * Register before the first save. Ranges added here are permanent and survive
  * every later rebuild of the exclusion list. */
 void savestate_exclude(void *p, size_t bytes);
+
+/* Zeroed memory held in the present, allocated once per id for the life of the
+ * process. The wrapper's own globals rewind with the game, so a static "already
+ * allocated" pointer goes back to NULL on every restore and the next call
+ * allocates and excludes another buffer; this remembers it in the control
+ * block, which never rewinds. NULL if the id is out of range or memory is out. */
+enum { SS_KEPT_CHUNK_A, SS_KEPT_CHUNK_B, SS_KEPT_DS_PRESENT, SS_KEPT_DS_SINK, SS_KEPT };
+void *savestate_kept(int id, size_t bytes);
 
 /* The pre-suspend heap census (gameheap.c) calls this for each heap it judges to
  * be regenerable game ASSETS - a large, pure-data HeapCreate heap that balloons on

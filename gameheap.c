@@ -45,6 +45,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <string.h>
@@ -56,6 +57,7 @@ int savestate_patch_iat_named(HMODULE mod, const char *dll, const char *fn, void
 			      void **prev);
 void savestate_game_heap(HANDLE h);
 void savestate_exclude(void *p, size_t bytes);
+void *savestate_game_import_hook(const char *fn);
 /* Defined further down with the note on why a fixed base is what makes a layout
  * reproducible. Declared here because the installer runs above it. */
 static HANDLE gh_create_heap(void);
@@ -68,15 +70,54 @@ static void gh_make_selfcontained(HANDLE h);
  * block. Returns 0 unless D3D9SW_WHOLESALE is set. */
 int gameheap_owned_heap(uintptr_t base);
 
+/* The import-mode installer runs at DLL attach, before the savestate log is
+ * open, and anything said then would go nowhere. So it is said here instead
+ * and replayed into the log by the first report. */
+static char g_early[8192];
+static int g_early_n, g_early_on;
+
 static void ss_log(const char *fmt, ...)
 {
 	char b[512];
 	va_list ap;
+	int n;
 
 	va_start(ap, fmt);
-	wvsprintfA(b, fmt, ap);
+	n = wvsprintfA(b, fmt, ap);
 	va_end(ap);
+	if (g_early_on) {
+		if (n > 0 && g_early_n + n < (int)sizeof(g_early)) {
+			memcpy(g_early + g_early_n, b, (size_t)n);
+			g_early_n += n;
+		}
+		return;
+	}
 	savestate_log_line(b);
+}
+
+static void gh_early_flush(void)
+{
+	char line[512];
+	int i = 0, k = 0;
+
+	if (!g_early_on)
+		return;
+	g_early_on = 0;
+	for (i = 0; i < g_early_n; i++) {
+		if (k < (int)sizeof(line) - 2)
+			line[k++] = g_early[i];
+		if (g_early[i] == '\n') {
+			line[k] = 0;
+			savestate_log_line(line);
+			k = 0;
+		}
+	}
+	if (k) {
+		line[k++] = '\n';
+		line[k] = 0;
+		savestate_log_line(line);
+	}
+	g_early_n = 0;
 }
 
 /* Big enough that a private heap serves it from its own reservation rather than
@@ -512,6 +553,176 @@ static HANDLE gh_serving_heap(void)
 	return (g_laa_on && g_laa_heap) ? g_laa_heap : g_heap;
 }
 
+/* D3D9SW_GHOWN (import mode, default on): the pinned span is served by this
+ * allocator instead of RtlCreateHeap. An NT heap keeps Windows' state in its
+ * header - links into ntdll's lock list, its entry in the process heap list,
+ * a per-heap key that encodes every block header - and a cross-launch restore
+ * put the old launch's copies of those back. Here every byte of state, lock
+ * included, sits at the start of the span, so the span restores as plain data.
+ *
+ * Size classes 16, 24, 32, 48 ... 64 MB, a LIFO free list per class and a
+ * bump pointer. No coalescing: a freed block only ever serves its own class. */
+#define GHO_NCLASS 46
+#define GHO_MAGIC ((uintptr_t)0x0DD5EED5u)
+#define GHO_COMMIT (1u << 20)
+
+typedef struct {
+	volatile LONG lock;
+	uintptr_t top, committed, end;
+	void *free[GHO_NCLASS];
+	unsigned long nalloc, nfree, nbad, nfull;
+} GhOwn;
+
+typedef struct {
+	uintptr_t magic; /* GHO_MAGIC ^ the block's own address */
+	uintptr_t cls;
+} GhOwnBlk;
+
+static GhOwn *g_own;
+
+static int gho_class(SIZE_T n, SIZE_T *cap)
+{
+	unsigned b;
+
+	if (n <= 16) {
+		*cap = 16;
+		return 0;
+	}
+	b = 31u - (unsigned)__builtin_clz((unsigned)(n - 1));
+	if (n <= ((SIZE_T)3 << (b - 1))) {
+		*cap = (SIZE_T)3 << (b - 1);
+		return (int)(2 * (b - 4) + 1);
+	}
+	*cap = (SIZE_T)1 << (b + 1);
+	return (int)(2 * (b + 1 - 4));
+}
+
+static SIZE_T gho_cap(int c)
+{
+	return (c & 1) ? (SIZE_T)3 << (c / 2 + 3) : (SIZE_T)1 << (c / 2 + 4);
+}
+
+static void gho_lock(void)
+{
+	while (InterlockedCompareExchange(&g_own->lock, 1, 0))
+		SwitchToThread();
+}
+
+static void gho_unlock(void)
+{
+	InterlockedExchange(&g_own->lock, 0);
+}
+
+static int gho_init(void *base, SIZE_T size)
+{
+	if (!VirtualAlloc(base, GHO_COMMIT, MEM_COMMIT, PAGE_READWRITE))
+		return 0;
+	g_own = (GhOwn *)base;
+	memset(g_own, 0, sizeof(*g_own));
+	g_own->top = ((uintptr_t)base + sizeof(GhOwn) + 15) & ~(uintptr_t)15;
+	g_own->committed = (uintptr_t)base + GHO_COMMIT;
+	g_own->end = (uintptr_t)base + size;
+	return 1;
+}
+
+static void *gho_alloc(SIZE_T n, int zero)
+{
+	SIZE_T cap;
+	int c = gho_class(n, &cap);
+	GhOwnBlk *b;
+
+	if (c >= GHO_NCLASS)
+		return NULL;
+	gho_lock();
+	b = (GhOwnBlk *)g_own->free[c];
+	if (b) {
+		g_own->free[c] = *(void **)(b + 1);
+	} else {
+		uintptr_t need = sizeof(GhOwnBlk) + cap, at = g_own->top;
+
+		if (at + need > g_own->end) {
+			g_own->nfull++;
+			gho_unlock();
+			return NULL;
+		}
+		while (at + need > g_own->committed) {
+			if (!VirtualAlloc((void *)g_own->committed, GHO_COMMIT, MEM_COMMIT,
+					  PAGE_READWRITE)) {
+				g_own->nfull++;
+				gho_unlock();
+				return NULL;
+			}
+			g_own->committed += GHO_COMMIT;
+		}
+		g_own->top = at + need;
+		b = (GhOwnBlk *)at;
+	}
+	b->magic = GHO_MAGIC ^ (uintptr_t)b;
+	b->cls = (uintptr_t)c;
+	g_own->nalloc++;
+	gho_unlock();
+	if (zero)
+		memset(b + 1, 0, n);
+	return b + 1;
+}
+
+static GhOwnBlk *gho_blk(void *p)
+{
+	GhOwnBlk *b = (GhOwnBlk *)p - 1;
+
+	if (!p || b->magic != (GHO_MAGIC ^ (uintptr_t)b) || b->cls >= GHO_NCLASS) {
+		if (g_own)
+			InterlockedIncrement((volatile LONG *)&g_own->nbad);
+		return NULL;
+	}
+	return b;
+}
+
+static BOOL gho_free(void *p)
+{
+	GhOwnBlk *b = gho_blk(p);
+
+	if (!b)
+		return FALSE;
+	gho_lock();
+	b->magic = 0;
+	*(void **)p = g_own->free[b->cls];
+	g_own->free[b->cls] = b;
+	g_own->nfree++;
+	gho_unlock();
+	return TRUE;
+}
+
+/* Grows in place within the block's class, else fails; the callers already
+ * move a block that HeapReAlloc could not resize. */
+static void *gho_realloc(void *p, SIZE_T n)
+{
+	GhOwnBlk *b = gho_blk(p);
+
+	return b && n <= gho_cap((int)b->cls) ? p : NULL;
+}
+
+static LPVOID gh_halloc(HANDLE h, DWORD flags, SIZE_T n)
+{
+	if (g_own && h == g_heap)
+		return gho_alloc(n, (flags & HEAP_ZERO_MEMORY) != 0);
+	return HeapAlloc(h, flags, n);
+}
+
+static BOOL gh_hfree(HANDLE h, DWORD flags, LPVOID p)
+{
+	if (g_own && h == g_heap)
+		return gho_free(p);
+	return HeapFree(h, flags, p);
+}
+
+static LPVOID gh_hrealloc(HANDLE h, DWORD flags, LPVOID p, SIZE_T n)
+{
+	if (g_own && h == g_heap)
+		return gho_realloc(p, n);
+	return HeapReAlloc(h, flags, p, n);
+}
+
 /* The whole reservation the block sits in, so one lookup covers a segment rather
  * than a page. Only ever called when a new allocation lands outside everything
  * we already know about, which after warm-up is almost never. */
@@ -603,6 +814,288 @@ static GhHead *ours_why(void *u, int *orphan)
 	return h;
 }
 
+/* ---- big blocks, import mode (D3D9SW_GAMEHEAP=2) ---------------------------
+ *
+ * A heap at a caller-chosen base is not growable, and a heap that cannot grow
+ * refuses any block above about 512 KB - measured: 300 KB is served from inside
+ * the region, 8 MB fails outright. PhysX's scene pools are bigger than that, and
+ * sending them back to the runtime puts them on the process heap, which the
+ * import mode leaves in the present. The bodies would rewind and the solver's
+ * buffers they point into would not.
+ *
+ * So big blocks get a region of their own with an allocator simple enough that
+ * all of its state - free list, high-water mark, lock - lives in the region's
+ * first page. Restoring the region restores the allocator with it, which is the
+ * property the process heap lacked. First fit over an address-ordered free list,
+ * coalesced on free; there are hundreds of these blocks, not millions. Freed
+ * memory stays committed, so the region's shape never changes under a save.
+ *
+ * The regions are chunks, added as the ones before fill and never released, so
+ * no size has to be guessed up front and no range in the ownership table ever
+ * goes stale. A chunk added after a save is simply not in that snapshot; with
+ * reclaim off (the default) the restore leaves it alone, and whatever it holds
+ * is unreachable from the rewound game - a leak, not a tear. A block bigger
+ * than a chunk gets a chunk of its own size. */
+typedef struct GhBigBlk {
+	uintptr_t magic;
+	size_t size; /* whole block, this header included */
+	struct GhBigBlk *next; /* free list only */
+	size_t pad;
+} GhBigBlk;
+
+typedef struct {
+	volatile LONG lock;
+	size_t cap; /* the whole reservation, this page included */
+	size_t top; /* bytes from the base handed out so far, this page included */
+	size_t committed;
+	GhBigBlk *free;
+	size_t live, peak;
+	unsigned long nalloc, nfail;
+} GhBigArena;
+
+#define GH_BIG_MAGIC ((uintptr_t)0x5BD1E995u)
+#define GH_BIG_GRAIN 4096u
+#define GH_BIG_COMMIT (1u << 20)
+#define GH_BIG_CHUNKS 64
+
+static GhBigArena *g_bigch[GH_BIG_CHUNKS];
+static volatile LONG g_nbig, g_big_grow;
+static size_t g_big_chunk; /* nonzero once import mode has armed big blocks */
+static unsigned long g_big_bad, g_big_nochunk;
+static int g_imports;		  /* installed by import table, not by detour */
+static unsigned long g_migrated; /* runtime blocks moved to us by a realloc */
+static void gh_add_range(uintptr_t lo, uintptr_t hi);
+static unsigned gh_knob(const char *name, unsigned def);
+
+static GhBigArena *big_chunk_of(const void *p)
+{
+	uintptr_t a = (uintptr_t)p;
+	LONG i, n = g_nbig;
+
+	for (i = 0; i < n; i++) {
+		uintptr_t lo = (uintptr_t)g_bigch[i];
+
+		if (a >= lo && a < lo + g_bigch[i]->cap)
+			return g_bigch[i];
+	}
+	return NULL;
+}
+
+static int in_big(const void *p)
+{
+	return g_nbig && big_chunk_of(p) != NULL;
+}
+
+static void big_lock(GhBigArena *c)
+{
+	while (InterlockedCompareExchange(&c->lock, 1, 0))
+		Sleep(0);
+}
+
+static void big_unlock(GhBigArena *c)
+{
+	InterlockedExchange(&c->lock, 0);
+}
+
+static GhBigBlk *chunk_alloc(GhBigArena *c, size_t need)
+{
+	uintptr_t lo = (uintptr_t)c;
+	GhBigBlk **pp, *b = NULL;
+
+	big_lock(c);
+	for (pp = &c->free; *pp; pp = &(*pp)->next)
+		if ((*pp)->size >= need) {
+			b = *pp;
+			break;
+		}
+	if (b) {
+		if (b->size - need >= GH_BIG) {
+			GhBigBlk *t = (GhBigBlk *)((char *)b + need);
+
+			t->magic = 0;
+			t->size = b->size - need;
+			t->next = b->next;
+			*pp = t;
+			b->size = need;
+		} else {
+			*pp = b->next;
+		}
+	} else {
+		if (need > c->cap - c->top) {
+			big_unlock(c);
+			return NULL;
+		}
+		if (c->top + need > c->committed) {
+			size_t want = (c->top + need + GH_BIG_COMMIT - 1) &
+				      ~(size_t)(GH_BIG_COMMIT - 1);
+
+			if (want > c->cap)
+				want = c->cap;
+			if (!VirtualAlloc((void *)(lo + c->committed), want - c->committed,
+					  MEM_COMMIT, PAGE_READWRITE)) {
+				c->nfail++;
+				big_unlock(c);
+				return NULL;
+			}
+			c->committed = want;
+		}
+		b = (GhBigBlk *)(lo + c->top);
+		b->size = need;
+		c->top += need;
+	}
+	b->magic = GH_BIG_MAGIC ^ (uintptr_t)b;
+	b->next = NULL;
+	c->live += b->size;
+	if (c->live > c->peak)
+		c->peak = c->live;
+	c->nalloc++;
+	big_unlock(c);
+	return b;
+}
+
+/* D3D9SW_GHBIG_PIN (default on in import mode): chunks are carved in order from
+ * one span reserved at a fixed address, so a second session has them at the
+ * same addresses as the first - one reservation, same allocation base, which is
+ * what a cross-session restore checks. OS-placed chunks landed somewhere new
+ * every launch and were most of the 49 regions a cross-session load refused. */
+#define GH_BIGPIN_BASE 0x80000000u
+static uintptr_t g_bigpin_base;
+static SIZE_T g_bigpin_size, g_bigpin_used;
+
+static void bigpin_reserve(void)
+{
+	unsigned mb = gh_knob("D3D9SW_GHBIG_PIN_MB", 1792);
+	uintptr_t base = gh_knob("D3D9SW_GHBIG_PIN", 1);
+	void *res;
+
+	if (!base || !mb)
+		return;
+	if (base == 1)
+		base = GH_BIGPIN_BASE;
+	res = VirtualAlloc((LPVOID)base, (SIZE_T)mb << 20, MEM_RESERVE, PAGE_READWRITE);
+	if (!res || (uintptr_t)res != base) {
+		ss_log("gameheap: could not pin %u MB for big blocks at %08lX (error %lu) - "
+		       "chunks go wherever Windows puts them, and will not be at the same "
+		       "addresses next session\n",
+		       mb, (unsigned long)base, GetLastError());
+		if (res)
+			VirtualFree(res, 0, MEM_RELEASE);
+		return;
+	}
+	g_bigpin_base = base;
+	g_bigpin_size = (SIZE_T)mb << 20;
+	ss_log("gameheap: big-block chunks PINNED in %u MB at %08lX\n", mb,
+	       (unsigned long)base);
+}
+
+/* One more chunk, at least `need` bytes of blocks. Serialised so two threads
+ * that both found every chunk full do not both reserve one. */
+static GhBigArena *chunk_add(size_t need)
+{
+	SIZE_T cap = g_big_chunk;
+	GhBigArena *c;
+	void *res;
+	LONG n;
+
+	if (need + GH_BIG_GRAIN > cap)
+		cap = (need + GH_BIG_GRAIN + 0xFFFFu) & ~(SIZE_T)0xFFFFu;
+	n = g_nbig;
+	if (n >= GH_BIG_CHUNKS)
+		return NULL;
+	if (g_bigpin_base && g_bigpin_used + cap <= g_bigpin_size) {
+		res = (void *)(g_bigpin_base + g_bigpin_used);
+		if (!VirtualAlloc(res, GH_BIG_GRAIN, MEM_COMMIT, PAGE_READWRITE))
+			return NULL;
+		g_bigpin_used += cap;
+	} else {
+		if (g_bigpin_base)
+			ss_log("gameheap: the pinned big-block span is full - chunk %ld goes "
+			       "OS-placed\n",
+			       (long)n);
+		res = VirtualAlloc(NULL, cap, MEM_RESERVE, PAGE_READWRITE);
+		if (!res)
+			return NULL;
+		if (!VirtualAlloc(res, GH_BIG_GRAIN, MEM_COMMIT, PAGE_READWRITE)) {
+			VirtualFree(res, 0, MEM_RELEASE);
+			return NULL;
+		}
+	}
+	c = (GhBigArena *)res;
+	c->cap = cap;
+	c->top = GH_BIG_GRAIN;
+	c->committed = GH_BIG_GRAIN;
+	gh_add_range((uintptr_t)res, (uintptr_t)res + cap);
+	g_bigch[n] = c;
+	InterlockedIncrement(&g_nbig);
+	return c;
+}
+
+static void *big_alloc(size_t n)
+{
+	size_t need = (n + sizeof(GhBigBlk) + GH_BIG_GRAIN - 1) & ~(size_t)(GH_BIG_GRAIN - 1);
+	GhBigBlk *b = NULL;
+	GhBigArena *c;
+	LONG i, seen = g_nbig;
+
+	if (!g_big_chunk || need < n)
+		return NULL;
+	for (i = 0; i < seen && !b; i++)
+		b = chunk_alloc(g_bigch[i], need);
+	if (b)
+		return b + 1;
+	while (InterlockedCompareExchange(&g_big_grow, 1, 0))
+		Sleep(0);
+	for (i = seen; i < g_nbig && !b; i++)
+		b = chunk_alloc(g_bigch[i], need);
+	if (!b) {
+		c = chunk_add(need);
+		if (c)
+			b = chunk_alloc(c, need);
+		else
+			g_big_nochunk++;
+	}
+	InterlockedExchange(&g_big_grow, 0);
+	return b ? b + 1 : NULL;
+}
+
+/* Takes what big_alloc returned. A header that does not check out is leaked
+ * rather than linked into the free list, for the same reason an orphan is. */
+static void big_free(void *p)
+{
+	GhBigBlk *b = (GhBigBlk *)p - 1, **pp, *prev = NULL;
+	GhBigArena *c = big_chunk_of(b);
+
+	if (!c || b->magic != (GH_BIG_MAGIC ^ (uintptr_t)b)) {
+		g_big_bad++;
+		return;
+	}
+	big_lock(c);
+	b->magic = 0;
+	c->live -= b->size;
+	for (pp = &c->free; *pp && *pp < b; pp = &(*pp)->next)
+		prev = *pp;
+	b->next = *pp;
+	*pp = b;
+	if (b->next && (char *)b + b->size == (char *)b->next) {
+		b->size += b->next->size;
+		b->next = b->next->next;
+	}
+	if (prev && (char *)prev + prev->size == (char *)b) {
+		prev->size += b->size;
+		prev->next = b->next;
+	}
+	big_unlock(c);
+}
+
+/* Every route that returns one of our blocks to its allocator. */
+static void gh_raw_free(void *u, GhHead *h, DWORD flags)
+{
+	if (in_big(u))
+		big_free(h);
+	else
+		gh_hfree(in_laa(u) ? g_laa_heap : g_heap, flags, h);
+}
+
 static void *give(void *raw, size_t n)
 {
 	GhHead *h = (GhHead *)raw;
@@ -623,7 +1116,7 @@ static void *gh_malloc_at(size_t n, unsigned site)
 {
 	void *raw;
 
-	if (!g_ready || n >= GH_BIG) {
+	if (!g_ready || (n >= GH_BIG && !g_big_chunk)) {
 		void *u = r_malloc(n);
 
 		g_toobig += n >= GH_BIG;
@@ -631,7 +1124,8 @@ static void *gh_malloc_at(size_t n, unsigned site)
 		gh_watch(u, n, site, 0xFFFFFFFFu, "malloc-big");
 		return u;
 	}
-	raw = HeapAlloc(gh_serving_heap(), 0, n + sizeof(GhHead));
+	raw = n >= GH_BIG ? big_alloc(n + sizeof(GhHead))
+			  : gh_halloc(gh_serving_heap(), 0, n + sizeof(GhHead));
 	if (!raw) {
 		g_fellback++;
 		if (g_laa_on)
@@ -661,7 +1155,7 @@ static void *gh_calloc_at(size_t c, size_t s, unsigned site)
 
 	if (c && n / c != s)
 		return NULL;
-	if (!g_ready || n >= GH_BIG) {
+	if (!g_ready || (n >= GH_BIG && !g_big_chunk)) {
 		void *u = r_calloc(c, s);
 
 		g_toobig += n >= GH_BIG;
@@ -669,7 +1163,13 @@ static void *gh_calloc_at(size_t c, size_t s, unsigned site)
 		gh_watch(u, n, site, 0xFFFFFFFFu, "calloc-big");
 		return u;
 	}
-	raw = HeapAlloc(gh_serving_heap(), HEAP_ZERO_MEMORY, n + sizeof(GhHead));
+	if (n >= GH_BIG) {
+		raw = big_alloc(n + sizeof(GhHead));
+		if (raw)
+			memset(raw, 0, n + sizeof(GhHead));
+	} else {
+		raw = gh_halloc(gh_serving_heap(), HEAP_ZERO_MEMORY, n + sizeof(GhHead));
+	}
 	if (!raw) {
 		g_fellback++;
 		if (g_laa_on)
@@ -755,7 +1255,7 @@ static void gh_free(void *p)
 	 * live in the region rather than the arena, and freeing it against the wrong
 	 * heap corrupts that heap's free list. in_laa is always false when the
 	 * experiment is off, so the normal path is unchanged. */
-	HeapFree(in_laa(p) ? g_laa_heap : g_heap, 0, h);
+	gh_raw_free(p, h, 0);
 }
 
 static void *gh_realloc_at(void *p, size_t n, unsigned site)
@@ -785,7 +1285,26 @@ static void *gh_realloc_at(void *p, size_t n, unsigned site)
 		}
 		/* Not ours, so it stays where it is. Growing it into our heap
 		 * would mean copying a block whose true size only the runtime
-		 * knows. */
+		 * knows.
+		 *
+		 * Except in import mode, where the runtime is a DLL that will say:
+		 * there a block left behind is on the process heap, which stays in
+		 * the present, so a container allocated at startup and grown later
+		 * would never rewind. Moved over on its first resize instead. */
+		if (g_imports && n) {
+			size_t had = r_msize(p);
+			void *q;
+
+			if (had == (size_t)-1)
+				return r_realloc(p, n);
+			q = gh_malloc_at(n, site);
+			if (!q)
+				return NULL;
+			memcpy(q, p, had < n ? had : n);
+			r_free(p);
+			g_migrated++;
+			return q;
+		}
 		return r_realloc(p, n);
 	}
 	if (!n) {
@@ -794,11 +1313,11 @@ static void *gh_realloc_at(void *p, size_t n, unsigned site)
 	}
 	old = h->size;
 	named = gh_tag_take(p, &osite, &osize, &oord);
-	if (n < GH_BIG) {
+	if (n < GH_BIG && !in_big(p)) {
 		/* Reuse the heap that issued this block, not the current serving heap:
 		 * under LAA_FALSE an older arena block and a newer region block coexist,
 		 * and reallocating one against the other's heap corrupts it. */
-		raw = HeapReAlloc(in_laa(p) ? g_laa_heap : g_heap, 0, h,
+		raw = gh_hrealloc(in_laa(p) ? g_laa_heap : g_heap, 0, h,
 				  n + sizeof(GhHead));
 		if (raw)
 			{
@@ -821,7 +1340,7 @@ static void *gh_realloc_at(void *p, size_t n, unsigned site)
 	/* Either it outgrew what we keep, or the heap could not extend it. Move
 	 * it out to the runtime rather than fail: a realloc that returns NULL
 	 * without freeing is correct C and a leak in most callers. */
-	q = n >= GH_BIG ? r_malloc(n) : gh_malloc_at(n, site);
+	q = (n >= GH_BIG && !g_big_chunk) ? r_malloc(n) : gh_malloc_at(n, site);
 	if (!q)
 		return NULL;
 	memcpy(q, p, old < n ? old : n);
@@ -903,9 +1422,9 @@ static void *gh_expand(void *p, size_t n)
 		}
 		return r_expand(p, n);
 	}
-	if (n >= GH_BIG)
+	if (n >= GH_BIG || in_big(p))
 		return NULL;
-	raw = HeapReAlloc(in_laa(p) ? g_laa_heap : g_heap, HEAP_REALLOC_IN_PLACE_ONLY,
+	raw = gh_hrealloc(in_laa(p) ? g_laa_heap : g_heap, HEAP_REALLOC_IN_PLACE_ONLY,
 			  h, n + sizeof(GhHead));
 	if (!raw)
 		return NULL;
@@ -1098,7 +1617,8 @@ static BOOL WINAPI gh_heapfree(HANDLE heap, DWORD flags, LPVOID p)
 		gh_peek_free(p);
 		gh_vorbis_free(p, (unsigned)h->size);
 		gh_busy_take(p);
-		return HeapFree(in_laa(p) ? g_laa_heap : g_heap, flags, h);
+		gh_raw_free(p, h, flags);
+		return TRUE;
 	}
 	/* The floor has to hold for the orphan case too, and this is the route the
 	 * observed crash actually took: RtlFreeHeap called with the process heap's
@@ -1372,7 +1892,7 @@ static void *gh_floor_arena(size_t n, int zero, unsigned site)
 	 * (GHFLOOR=2) keeps everything in the atomically-captured arena. */
 	if (g_floor_va && n >= GH_BIG)
 		return gh_va_alloc(n, site);
-	raw = HeapAlloc(gh_serving_heap(), zero ? HEAP_ZERO_MEMORY : 0,
+	raw = gh_halloc(gh_serving_heap(), zero ? HEAP_ZERO_MEMORY : 0,
 			n + sizeof(GhHead));
 	if (!raw) {
 		g_fellback++;
@@ -1693,10 +2213,77 @@ int gameheap_own_va_ranges(uintptr_t *base, uintptr_t *size, int max)
 	return n;
 }
 
+/* Every big reservation NTLOG saw, so the save-time census can say which of
+ * the big allocations it lists were made after the hooks armed, and from where.
+ * One not in here predates gameheap_install. Append-only and lock-free: the
+ * slot is claimed before it is filled, and base is written last. */
+#define GH_VAORG_CAP 1024
+static struct {
+	volatile uintptr_t base;
+	uintptr_t size, off;
+	char mod[24];
+} g_vaorg[GH_VAORG_CAP];
+static volatile LONG g_vaorg_n;
+
+static void vaorg_add(uintptr_t base, uintptr_t size, const char *mod, uintptr_t off)
+{
+	LONG i = InterlockedIncrement(&g_vaorg_n) - 1;
+
+	if (i >= GH_VAORG_CAP)
+		return;
+	g_vaorg[i].size = size;
+	g_vaorg[i].off = off;
+	lstrcpynA(g_vaorg[i].mod, mod, sizeof(g_vaorg[i].mod));
+	MemoryBarrier();
+	g_vaorg[i].base = base;
+}
+
+/* The i-th reservation NTLOG saw: 1 with base, size and originating module,
+ * 0 past the end or for a slot still being filled. */
+int gameheap_va_origin_at(int i, uintptr_t *base, uintptr_t *size, const char **mod)
+{
+	LONG n = g_vaorg_n;
+
+	if (n > GH_VAORG_CAP)
+		n = GH_VAORG_CAP;
+	if (i < 0 || i >= n || !g_vaorg[i].base)
+		return 0;
+	*base = g_vaorg[i].base;
+	*size = g_vaorg[i].size;
+	*mod = g_vaorg[i].mod;
+	return 1;
+}
+
+int gameheap_va_origin_count(void)
+{
+	return g_vaorg_n > GH_VAORG_CAP ? GH_VAORG_CAP : (int)g_vaorg_n;
+}
+
+/* 1 and "module+offset" in out when NTLOG saw a reservation at exactly base;
+ * the latest one wins, since a freed base can be handed out again. */
+int gameheap_va_origin(uintptr_t base, char *out, int cap)
+{
+	LONG n = g_vaorg_n, i;
+
+	if (n > GH_VAORG_CAP)
+		n = GH_VAORG_CAP;
+	for (i = n - 1; i >= 0; i--)
+		if (g_vaorg[i].base == base) {
+			char t[48];
+
+			wsprintfA(t, "%.23s+%lX", g_vaorg[i].mod,
+				  (unsigned long)g_vaorg[i].off);
+			lstrcpynA(out, t, cap);
+			return 1;
+		}
+	return 0;
+}
+
 static LONG WINAPI gh_ntav(HANDLE proc, PVOID *base, ULONG_PTR zb, PSIZE_T size,
 			   ULONG type, ULONG prot)
 {
 	void *ret = __builtin_return_address(0);
+	PVOID in = base ? *base : NULL;
 	/* Forward first, always, on any thread - no thread-local touched here, so a
 	 * loader thread without our TLS cannot fault (the __thread version did). */
 	LONG st = r_ntav(proc, base, zb, size, type, prot);
@@ -1708,9 +2295,11 @@ static LONG WINAPI gh_ntav(HANDLE proc, PVOID *base, ULONG_PTR zb, PSIZE_T size,
 	uintptr_t ooff = 0;
 	int ours = 0;
 
-	/* Only a successful self reservation is ours to track or log. */
+	/* Only a successful self reservation is ours to track or log. MEM_COMMIT
+	 * with no base reserves too, and it is how the heap takes every large
+	 * block; those are logged, but the exclusion keeps to MEM_RESERVE. */
 	if ((!g_ntlog && !g_swexcl) || st < 0 || proc != (HANDLE)(LONG_PTR)-1 ||
-	    !(type & MEM_RESERVE))
+	    !((type & MEM_RESERVE) || (!in && (type & MEM_COMMIT))))
 		return st;
 	rbase = base ? *base : NULL;
 
@@ -1743,8 +2332,10 @@ static LONG WINAPI gh_ntav(HANDLE proc, PVOID *base, ULONG_PTR zb, PSIZE_T size,
 	}
 
 	/* Record ours for exclusion - any size, no scope floor, lock-free table. */
-	if (g_swexcl && ours && rbase)
+	if (g_swexcl && ours && rbase && (type & MEM_RESERVE))
 		ourva_add((uintptr_t)rbase, got);
+	if (g_ntlog && rbase && got >= g_valog_min)
+		vaorg_add((uintptr_t)rbase, got, onm, ooff);
 
 	if (g_ntlog && got >= g_valog_min &&
 	    InterlockedCompareExchange(&g_hooklog, 1, 0) == 0) {
@@ -1804,6 +2395,39 @@ static LONG WINAPI gh_ntfv(HANDLE proc, PVOID *base, PSIZE_T size, ULONG freetyp
  * instruction - so 5 bytes displace cleanly. Refuse anything else rather than
  * corrupt an unknown prologue. The displaced bytes plus a jump back become the
  * trampoline, returned in *realout for the hook to forward through. */
+/* The trampolines' fixed home. The hooks reach them through pointers in our
+ * rewound .data, so a load from another launch must find them where the saving
+ * launch had them - a per-launch address there was executed by the first
+ * thread to allocate after every cross-launch load. 32 bytes per hook. */
+#define GH_HOME_TRAMP 0x5FEF0000u
+
+static unsigned char *tramp_alloc(void)
+{
+	static unsigned char *page;
+	static int used;
+
+	if (!page) {
+		page = (unsigned char *)VirtualAlloc((void *)GH_HOME_TRAMP, 4096,
+						     MEM_COMMIT | MEM_RESERVE,
+						     PAGE_EXECUTE_READWRITE);
+		if (!page) {
+			ss_log("gameheap: NT hook - trampoline home %08lX taken (error %lu); "
+			       "placed by the OS, so a load from another launch will jump "
+			       "to the old one\n",
+			       (unsigned long)GH_HOME_TRAMP, GetLastError());
+			page = (unsigned char *)VirtualAlloc(NULL, 4096,
+							     MEM_COMMIT | MEM_RESERVE,
+							     PAGE_EXECUTE_READWRITE);
+		}
+		if (!page)
+			return NULL;
+	}
+	if (used + 32 > 4096)
+		return NULL;
+	used += 32;
+	return page + used - 32;
+}
+
 static int ntdll_inline_hook(const char *name, void *hookfn, void **realout)
 {
 	HMODULE nt = GetModuleHandleA("ntdll.dll");
@@ -1816,25 +2440,35 @@ static int ntdll_inline_hook(const char *name, void *hookfn, void **realout)
 		ss_log("gameheap: NT hook - %s not found\n", name);
 		return 0;
 	}
-	if (t[0] != 0xB8) {
+	/* E9 is an earlier detour - the steam_api.dll shim arms its recorder on
+	 * this export before the game starts. Chain behind it: the trampoline is a
+	 * jmp to its hook, which forwards to the real stub itself. */
+	if (t[0] != 0xB8 && t[0] != 0xE9) {
 		ss_log("gameheap: NT hook - %s stub at %p starts 0x%02X, not the expected "
 		       "B8; not hooking\n",
 		       name, (void *)t, t[0]);
 		return 0;
 	}
-	tr = (unsigned char *)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE,
-					   PAGE_EXECUTE_READWRITE);
+	tr = tramp_alloc();
 	if (!tr) {
 		ss_log("gameheap: NT hook - trampoline page refused for %s\n", name);
 		return 0;
 	}
-	memcpy(tr, t, 5);     /* the displaced mov eax, SSN */
-	tr[5] = 0xE9;         /* jmp back to the rest of the stub */
-	*(LONG *)(tr + 6) = (LONG)((t + 5) - (tr + 10));
+	if (t[0] == 0xE9) {
+		unsigned char *prev = t + 5 + *(LONG *)(t + 1);
+
+		tr[0] = 0xE9;
+		*(LONG *)(tr + 1) = (LONG)(prev - (tr + 5));
+		ss_log("gameheap: NT hook - %s already detoured to %p; chaining behind it\n",
+		       name, (void *)prev);
+	} else {
+		memcpy(tr, t, 5);     /* the displaced mov eax, SSN */
+		tr[5] = 0xE9;         /* jmp back to the rest of the stub */
+		*(LONG *)(tr + 6) = (LONG)((t + 5) - (tr + 10));
+	}
 	*realout = tr;
 	if (!VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &old)) {
 		ss_log("gameheap: NT hook - could not make %s writable\n", name);
-		VirtualFree(tr, 0, MEM_RELEASE);
 		*realout = NULL;
 		return 0;
 	}
@@ -2207,6 +2841,2832 @@ int gameheap_install(void)
 	return wired;
 }
 
+/* ------------------------------------- import mode (D3D9SW_GAMEHEAP=2)
+ *
+ * The same private heap for a game that links the C runtime as a DLL, which is
+ * the easy case the detours above had to work around. Haydee is one: every one
+ * of its modules - haydee.dll, game.dll and the three PhysX DLLs - takes malloc
+ * and friends from api-ms-win-crt-heap, which is ucrtbase, which allocates from
+ * the process heap. That shared heap is what the restore could neither rewind
+ * (Windows keeps low-fragmentation bookkeeping for it outside its segments, and
+ * the first allocation after a restore divided by a zero block count) nor hold
+ * back (the game's objects would stay in the future).
+ *
+ * So the import slots are pointed at us, module by module, and the game's
+ * allocations land in a heap nothing else uses. Selected by '2' rather than '1'
+ * so a game configured for the detour build is never touched by this one, and
+ * installed only from the OpenGL wrapper's attach, which is the one build that
+ * runs early enough to see these modules before their own initialisation.
+ *
+ * What makes it safe to be partial: frees dispatch per pointer, so blocks the
+ * runtime issued before the install still go back to it; and the runtime's own
+ * HeapFree, HeapReAlloc and HeapSize imports are patched as a floor, so a block
+ * of ours that reaches ucrtbase by any route - another module's free, a realloc
+ * inside the runtime, _aligned_free - is caught there instead of being handed
+ * to the process heap. */
+typedef void *(__cdecl *PFN_aligned_malloc)(size_t, size_t);
+
+static LPVOID(WINAPI *r_crt_hra)(HANDLE, DWORD, LPVOID, SIZE_T);
+static SIZE_T(WINAPI *r_crt_hsz)(HANDLE, DWORD, LPCVOID);
+static WCHAR g_game_dir[MAX_PATH];
+static int g_game_dir_n;
+static HMODULE g_self;
+static unsigned long g_mods_patched, g_slots_patched, g_mods_unbound;
+
+/* ucrtbase's layout, reproduced exactly: the block the allocator issued, stored
+ * in the pointer-sized word below the aligned address. That is what lets each
+ * side free the other's blocks - the runtime's _aligned_free reads our word and
+ * frees our block through its free, which the floor catches; ours reads the
+ * runtime's word and frees its block through gh_free, which forwards it. */
+static void *__cdecl gh_aligned_malloc(size_t n, size_t a)
+{
+	uintptr_t raw, p;
+
+	if (!a || (a & (a - 1)))
+		return NULL;
+	if (a < sizeof(void *))
+		a = sizeof(void *);
+	if (n > (size_t)-1 - a - sizeof(void *))
+		return NULL;
+	raw = (uintptr_t)gh_malloc_at(n + a - 1 + sizeof(void *),
+				      gh_site_of(__builtin_return_address(0)));
+	if (!raw)
+		return NULL;
+	p = (raw + sizeof(void *) + a - 1) & ~(uintptr_t)(a - 1);
+	((uintptr_t *)p)[-1] = raw;
+	return (void *)p;
+}
+
+static void __cdecl gh_aligned_free(void *p)
+{
+	if (p)
+		gh_free((void *)((uintptr_t *)((uintptr_t)p & ~(uintptr_t)(sizeof(void *) - 1)))[-1]);
+}
+
+static LPVOID WINAPI gh_crt_heaprealloc(HANDLE heap, DWORD flags, LPVOID p, SIZE_T n)
+{
+	int orphan = 0;
+	GhHead *h = g_ready ? ours_why(p, &orphan) : NULL;
+
+	if (h) {
+		g_caught++;
+		if (flags & HEAP_REALLOC_IN_PLACE_ONLY)
+			return gh_expand(p, n);
+		return gh_realloc_at(p, n ? n : 1, 0xFFFFFFFFu);
+	}
+	if (orphan) {
+		gh_orphan_note("HeapReAlloc", p);
+		return NULL;
+	}
+	return r_crt_hra(heap, flags, p, n);
+}
+
+static SIZE_T WINAPI gh_crt_heapsize(HANDLE heap, DWORD flags, LPCVOID p)
+{
+	int orphan = 0;
+	GhHead *h = g_ready ? ours_why((void *)p, &orphan) : NULL;
+
+	if (h)
+		return h->size;
+	if (orphan) {
+		gh_orphan_note("HeapSize", (void *)p);
+		return 0;
+	}
+	return r_crt_hsz(heap, flags, p);
+}
+
+/* One import slot by name. Unlike savestate_patch_iat_named this records the
+ * original in *real BEFORE the slot changes, so a thread that arrives through
+ * the new slot never finds a forwarding pointer still unset; and it refuses a
+ * slot the loader has not yet resolved, which would otherwise be overwritten
+ * with the real address the moment it was. */
+static int gh_iat_swap(HMODULE mod, const char *dll, const char *fn, void *to, void **real)
+{
+	unsigned char *base = (unsigned char *)mod;
+	IMAGE_NT_HEADERS *nt;
+	IMAGE_IMPORT_DESCRIPTOR *imp;
+	DWORD rva;
+	int n = 0;
+
+	if (!mod || ((IMAGE_DOS_HEADER *)base)->e_magic != IMAGE_DOS_SIGNATURE)
+		return 0;
+	nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE)
+		return 0;
+	rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+	if (!rva)
+		return 0;
+	for (imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + rva); imp->Name; imp++) {
+		IMAGE_THUNK_DATA *orig, *cur;
+
+		if (dll && lstrcmpiA((const char *)(base + imp->Name), dll))
+			continue;
+		if (!imp->OriginalFirstThunk)
+			continue;
+		orig = (IMAGE_THUNK_DATA *)(base + imp->OriginalFirstThunk);
+		cur = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
+		for (; orig->u1.AddressOfData; orig++, cur++) {
+			DWORD old;
+
+			if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG)
+				continue;
+			if (lstrcmpA((const char *)((IMAGE_IMPORT_BY_NAME *)(base + orig->u1.AddressOfData))->Name,
+				     fn))
+				continue;
+			if (cur->u1.Function == orig->u1.AddressOfData)
+				return -1;
+			if (cur->u1.Function == (ULONG_PTR)to) {
+				n++;
+				continue;
+			}
+			if (real && !*real)
+				*real = (void *)cur->u1.Function;
+			if (!VirtualProtect(cur, sizeof(void *), PAGE_READWRITE, &old))
+				continue;
+			cur->u1.Function = (ULONG_PTR)to;
+			VirtualProtect(cur, sizeof(void *), old, &old);
+			n++;
+		}
+	}
+	return n;
+}
+
+static const struct {
+	const char *name;
+	void *ours;
+} kImpFns[] = {
+	{ "malloc", (void *)gh_malloc },
+	{ "calloc", (void *)gh_calloc },
+	{ "realloc", (void *)gh_realloc },
+	{ "free", (void *)gh_free },
+	{ "_msize", (void *)gh_msize },
+	{ "_recalloc", (void *)gh_recalloc },
+	{ "_expand", (void *)gh_expand },
+	{ "_aligned_malloc", (void *)gh_aligned_malloc },
+	{ "_aligned_free", (void *)gh_aligned_free },
+};
+
+static const char *const kImpDlls[] = { "api-ms-win-crt-heap-l1-1-0.dll", "ucrtbase.dll" };
+
+/* Our other wrappers sit in the game folder too and keep the runtime's heap.
+ * This one does not: its GL object tables describe the same moment the game's
+ * state does and have always rewound with it, back when that meant the process
+ * heap. The engine in this module never calls malloc, so nothing it holds
+ * across a restore lands in the heap being restored. */
+static const char *const kNotGame[] = { "opengl32.dll", "d3d9.dll",	 "d3d9_sw.dll",
+					"d3d11.dll",	"dxgi.dll",	 "dsound.dll",
+					"xaudio2_9.dll", "xinput1_4.dll" };
+
+static int gh_is_game_module(HMODULE mod, const WCHAR *path)
+{
+	const WCHAR *leaf = path;
+	char base[64];
+	unsigned i;
+	int k;
+
+	if (mod == g_self)
+		return 1;
+	if (!g_game_dir_n)
+		return 0;
+	for (k = 0; k < g_game_dir_n; k++) {
+		WCHAR a = path[k], b = g_game_dir[k];
+
+		if (!a)
+			return 0;
+		if (a >= 'A' && a <= 'Z')
+			a += 32;
+		if (b >= 'A' && b <= 'Z')
+			b += 32;
+		if (a != b)
+			return 0;
+	}
+	for (i = 0; path[i]; i++)
+		if (path[i] == '\\' || path[i] == '/')
+			leaf = path + i + 1;
+	for (i = 0; leaf[i] && i < sizeof(base) - 1; i++)
+		base[i] = (char)leaf[i];
+	base[i] = 0;
+	for (i = 0; i < sizeof(kNotGame) / sizeof(kNotGame[0]); i++)
+		if (!lstrcmpiA(base, kNotGame[i]))
+			return 0;
+	return 1;
+}
+
+/* The game's own VirtualAlloc and VirtualFree, journalled into a ring held in
+ * the present so the history from before a restore is still there after it.
+ *
+ * Haydee keeps arenas of VirtualAlloc'd blocks chained through a word at +0x0C,
+ * and after a room-to-room restore its arena reset read the chain into a block
+ * that was already released. Whether that block was freed earlier in the same
+ * walk, by another reset, or never put back by the restore is a question only
+ * the order of the calls answers, and the fault report prints this ring. */
+typedef struct {
+	char op; /* A alloc, F free, R restore */
+	DWORD tid;
+	uintptr_t addr, size, ret, caller;
+	DWORD how;
+} GhVaEv;
+
+#define GH_VAJ_N 1024u
+typedef struct {
+	volatile LONG next;
+	GhVaEv e[GH_VAJ_N];
+} GhVaJ;
+
+static GhVaJ *g_vaj;
+static int g_vaj_held;
+static LPVOID(WINAPI *r_va)(LPVOID, SIZE_T, DWORD, DWORD);
+static BOOL(WINAPI *r_vf)(LPVOID, SIZE_T, DWORD);
+
+/* Fixed homes for our held-in-the-present buffers, under the PhysX tracer's.
+ * The buffers are excluded from saves but the pointers to them are in our own
+ * rewound .data, so a load from another launch must find them where the saving
+ * launch had them. The raw span stops at GH_HOMES for this. */
+#define GH_HOMES 0x5FC00000u
+#define GH_HOME_RES 0x5FC00000u
+#define GH_HOME_VAJ 0x5FCA0000u
+#define GH_HOME_AL 0x5FCB0000u
+
+static void *gh_home_alloc(uintptr_t home, SIZE_T size)
+{
+	LPVOID(WINAPI * va)(LPVOID, SIZE_T, DWORD, DWORD) = r_va ? r_va : VirtualAlloc;
+	void *p = va((void *)home, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+	if (!p) {
+		ss_log("gameheap: fixed home %08lX (%lu KB) taken - placed by the OS, so a "
+		       "load from another launch will point at the old one\n",
+		       (unsigned long)home, (unsigned long)(size >> 10));
+		p = va(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	}
+	return p;
+}
+
+static GhVaEv *vaj_put(char op, uintptr_t addr, uintptr_t size, uintptr_t ret, DWORD how,
+		       void *caller)
+{
+	GhVaEv *e;
+
+	if (!g_vaj)
+		return NULL;
+	e = &g_vaj->e[(unsigned)(InterlockedIncrement(&g_vaj->next) - 1) % GH_VAJ_N];
+	e->op = op;
+	e->tid = GetCurrentThreadId();
+	e->addr = addr;
+	e->size = size;
+	e->ret = ret;
+	e->how = how;
+	e->caller = (uintptr_t)caller;
+	return e;
+}
+
+/* Every reservation the game makes itself, by 64 KB granule, held in the
+ * present like the journal so it describes the address space as it really is.
+ *
+ * Haydee reserves its arena blocks one granule at a time, thousands of them,
+ * and releases them wholesale on a room change. Two things go wrong across a
+ * restore without this. A block the game released after a save leaves a hole
+ * the save still needs, and a new thread's TEB - placed at page granularity -
+ * can land in it, refusing every later restore of that save. And blocks the
+ * game reserved after a save are unknown to the rewound game, so each restore
+ * leaked them, and the next save captured the leak: 237 regions grew to 8392. */
+enum { GH_RES_FREE, GH_RES_LIVE, GH_RES_PARKED };
+typedef struct {
+	volatile LONG seq;
+	LONG parked, released, held_again;
+	struct {
+		LONG born;
+		unsigned char state;
+	} g[65536];
+} GhRes;
+
+static GhRes *g_res;
+_Static_assert(sizeof(GhRes) <= GH_HOME_VAJ - GH_HOME_RES, "GhRes outgrew its home");
+_Static_assert(sizeof(GhVaJ) <= GH_HOME_AL - GH_HOME_VAJ, "GhVaJ outgrew its home");
+static int g_res_held;
+
+int savestate_alloc_saved(uintptr_t alloc_base, int slotno);
+
+/* D3D9SW_GHRAW_PIN (default on): the game's own VirtualAlloc(NULL, ...)
+ * reservations are carved by 64 KB granule from one span at a fixed address,
+ * instead of wherever Windows puts them. A release
+ * decommits and frees the granules; the span itself is never given back. The
+ * map is in our image's data, so it rewinds with the game and always agrees
+ * with what the restored game thinks it holds. Placed by Windows, these blocks
+ * were the regions a cross-session load still refused once modules and chunks
+ * stood still. */
+#define GH_RAW_GRAN 0x10000u
+#define GH_RAW_MAX 8192u
+static uintptr_t g_raw_base;
+static unsigned g_raw_n, g_raw_full_said;
+static unsigned short g_raw_len[GH_RAW_MAX]; /* run length at its first granule */
+static unsigned char g_raw_used[GH_RAW_MAX];
+static volatile LONG g_raw_lock;
+
+static void raw_reserve(uintptr_t base, uintptr_t top)
+{
+	SIZE_T size;
+
+	if (!gh_knob("D3D9SW_GHRAW_PIN", 1) || top <= base)
+		return;
+	size = top - base;
+	if (size > (SIZE_T)GH_RAW_MAX * GH_RAW_GRAN)
+		size = (SIZE_T)GH_RAW_MAX * GH_RAW_GRAN;
+	for (; size >= 64u << 20; size -= 64u << 20)
+		if (VirtualAlloc((LPVOID)base, size, MEM_RESERVE, PAGE_READWRITE) ==
+		    (LPVOID)base) {
+			g_raw_base = base;
+			g_raw_n = (unsigned)(size / GH_RAW_GRAN);
+			ss_log("gameheap: the game's own reservations PINNED in %lu MB at "
+			       "%08lX\n",
+			       (unsigned long)(size >> 20), (unsigned long)base);
+			return;
+		}
+	ss_log("gameheap: could not pin a span for the game's own reservations at %08lX "
+	       "(error %lu) - Windows places them\n",
+	       (unsigned long)base, GetLastError());
+}
+
+static LPVOID raw_take(SIZE_T size, DWORD type, DWORD prot)
+{
+	unsigned need = (unsigned)((size + GH_RAW_GRAN - 1) / GH_RAW_GRAN), i, run = 0;
+	LPVOID p = NULL;
+
+	if (!need || need > 0xFFFFu)
+		return NULL;
+	while (InterlockedCompareExchange(&g_raw_lock, 1, 0))
+		YieldProcessor();
+	for (i = 0; i < g_raw_n; i++) {
+		run = g_raw_used[i] ? 0 : run + 1;
+		if (run == need)
+			break;
+	}
+	if (run == need) {
+		unsigned at = i + 1 - need, k;
+
+		p = (LPVOID)(g_raw_base + (uintptr_t)at * GH_RAW_GRAN);
+		/* A restore rewinds the map but not the pages: granules taken after
+		 * the save read as free yet may still be committed, and the game is
+		 * owed zeroed memory. */
+		r_vf(p, (SIZE_T)need * GH_RAW_GRAN, MEM_DECOMMIT);
+		if ((type & MEM_COMMIT) && !r_va(p, size, MEM_COMMIT, prot))
+			p = NULL;
+		else {
+			for (k = at; k < at + need; k++)
+				g_raw_used[k] = 1;
+			g_raw_len[at] = (unsigned short)need;
+		}
+	} else if (g_raw_full_said < 8) {
+		unsigned taken = 0, k;
+
+		for (k = 0; k < g_raw_n; k++)
+			taken += g_raw_used[k];
+		g_raw_full_said++;
+		ss_log("gameheap: %lu KB does not fit in the pinned span for the game's own "
+		       "reservations (%u of %u 64 KB granules taken) - placed by Windows "
+		       "instead\n",
+		       (unsigned long)(size >> 10), taken, g_raw_n);
+	}
+	g_raw_lock = 0;
+	return p;
+}
+
+/* 1 if addr was ours to release (and is now released), 0 if not in the span. */
+static int raw_give(LPVOID addr)
+{
+	uintptr_t a = (uintptr_t)addr;
+	unsigned at, k, n;
+
+	if (!g_raw_base || a < g_raw_base || a >= g_raw_base + (uintptr_t)g_raw_n * GH_RAW_GRAN)
+		return 0;
+	at = (unsigned)((a - g_raw_base) / GH_RAW_GRAN);
+	while (InterlockedCompareExchange(&g_raw_lock, 1, 0))
+		YieldProcessor();
+	n = g_raw_len[at];
+	if (n && g_raw_used[at]) {
+		r_vf(addr, (SIZE_T)n * GH_RAW_GRAN, MEM_DECOMMIT);
+		for (k = at; k < at + n && k < g_raw_n; k++)
+			g_raw_used[k] = 0;
+		g_raw_len[at] = 0;
+	}
+	g_raw_lock = 0;
+	return 1;
+}
+
+static LPVOID WINAPI gh_va_j(LPVOID addr, SIZE_T size, DWORD type, DWORD prot)
+{
+	LPVOID p;
+
+	if (!addr && (type & MEM_RESERVE) && g_raw_base && !(type & (MEM_PHYSICAL | MEM_LARGE_PAGES)) &&
+	    (p = raw_take(size, type, prot)) != NULL) {
+		vaj_put('A', 0, size, (uintptr_t)p, type, __builtin_return_address(0));
+		return p;
+	}
+	p = r_va(addr, size, type, prot);
+
+	if (!(type & MEM_RESERVE) && p == addr)
+		return p; /* commit inside an existing reservation: too frequent to keep */
+	vaj_put('A', (uintptr_t)addr, size, (uintptr_t)p, type, __builtin_return_address(0));
+	if (g_res && p && (type & MEM_RESERVE) && !((uintptr_t)p & 0xFFFF)) {
+		unsigned i = (unsigned)((uintptr_t)p >> 16);
+		g_res->g[i].born = InterlockedIncrement(&g_res->seq);
+		g_res->g[i].state = GH_RES_LIVE;
+	}
+	return p;
+}
+
+static BOOL WINAPI gh_vf_j(LPVOID addr, SIZE_T size, DWORD type)
+{
+	GhVaEv *e = vaj_put('F', (uintptr_t)addr, size, 0, type, __builtin_return_address(0));
+	unsigned i = (unsigned)((uintptr_t)addr >> 16);
+	BOOL ok;
+
+	if ((type & MEM_RELEASE) && raw_give(addr)) {
+		if (e)
+			e->ret = 1;
+		return TRUE;
+	}
+
+	if (g_res && (type & MEM_RELEASE) && !((uintptr_t)addr & 0xFFFF) &&
+	    g_res->g[i].state == GH_RES_LIVE && savestate_alloc_saved((uintptr_t)addr, -1)) {
+		/* Released as far as the game knows; reserved as far as anyone
+		 * else can tell, so the address is still free for a restore. */
+		ok = r_vf(addr, 0, MEM_DECOMMIT);
+		if (ok) {
+			g_res->g[i].state = GH_RES_PARKED;
+			InterlockedIncrement(&g_res->parked);
+		}
+		if (e) {
+			e->ret = (uintptr_t)ok;
+			e->how |= 0x80000000u;
+		}
+		return ok;
+	}
+	ok = r_vf(addr, size, type);
+	if (g_res && ok && (type & MEM_RELEASE) && !((uintptr_t)addr & 0xFFFF))
+		g_res->g[i].state = GH_RES_FREE;
+	if (e)
+		e->ret = (uintptr_t)ok;
+	return ok;
+}
+
+LONG gameheap_res_seq(void)
+{
+	return g_res ? g_res->seq : 0;
+}
+
+/* After a restore's copy, threads still suspended. Blocks reserved after the
+ * save the game was wound back to are unknown to it now: released, or kept
+ * reserved if another save holds them. Parked blocks this save held are
+ * committed again and live; the rest stay parked. */
+void gameheap_res_restored(int slotno, LONG seq_at_save)
+{
+	unsigned i;
+	LONG released = 0, parked = 0, again = 0;
+
+	if (!g_res || !seq_at_save)
+		return;
+	for (i = 1; i < 65536; i++) {
+		uintptr_t a = (uintptr_t)i << 16;
+		unsigned char st = g_res->g[i].state;
+
+		if (st == GH_RES_PARKED) {
+			if (savestate_alloc_saved(a, slotno)) {
+				g_res->g[i].state = GH_RES_LIVE;
+				again++;
+			}
+			continue;
+		}
+		if (st != GH_RES_LIVE || g_res->g[i].born <= seq_at_save ||
+		    savestate_alloc_saved(a, slotno))
+			continue;
+		if (savestate_alloc_saved(a, -1)) {
+			if (r_vf((LPVOID)a, 0, MEM_DECOMMIT)) {
+				g_res->g[i].state = GH_RES_PARKED;
+				parked++;
+			}
+		} else if (r_vf((LPVOID)a, 0, MEM_RELEASE)) {
+			g_res->g[i].state = GH_RES_FREE;
+			released++;
+		}
+	}
+	ss_log("  game blocks: %ld reserved since this save released, %ld kept for another "
+	       "save, %ld held back since an earlier release and live again; %ld release(s) "
+	       "parked so far\n",
+	       (long)released, (long)parked, (long)again, (long)g_res->parked);
+}
+
+/* After a save: parked blocks no save holds any more are let go for real. */
+void gameheap_res_saved(void)
+{
+	unsigned i;
+	LONG n = 0;
+
+	if (!g_res)
+		return;
+	for (i = 1; i < 65536; i++)
+		if (g_res->g[i].state == GH_RES_PARKED &&
+		    !savestate_alloc_saved((uintptr_t)i << 16, -1) &&
+		    r_vf((LPVOID)((uintptr_t)i << 16), 0, MEM_RELEASE)) {
+			g_res->g[i].state = GH_RES_FREE;
+			n++;
+		}
+	if (n)
+		ss_log("  game blocks: %ld held-back release(s) no save needs any more, let go\n",
+		       (long)n);
+}
+
+void gameheap_va_mark_restore(void)
+{
+	vaj_put('R', 0, 0, 0, 0, NULL);
+}
+
+/* Last n events, oldest first. Plain formatting only: called from the fault
+ * report, which may be running on a thread that holds a heap lock. */
+void gameheap_va_dump(unsigned n)
+{
+	unsigned end, i, start;
+	MEMORY_BASIC_INFORMATION q;
+
+	if (!g_vaj)
+		return;
+	if (VirtualQuery(g_vaj, &q, sizeof(q)) != sizeof(q) || q.State != MEM_COMMIT ||
+	    (q.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+		ss_log("       game VirtualAlloc journal at %p is unreadable (state %lx "
+		       "protect %lx, home %08lX) - not dumped\n",
+		       (void *)g_vaj, (unsigned long)q.State, (unsigned long)q.Protect,
+		       (unsigned long)GH_HOME_VAJ);
+		return;
+	}
+	if (!g_vaj->next)
+		return;
+	end = (unsigned)g_vaj->next;
+	if (n > GH_VAJ_N)
+		n = GH_VAJ_N;
+	start = end > n ? end - n : 0;
+	ss_log("       game VirtualAlloc/VirtualFree, last %u of %u call(s), oldest first:\n",
+	       end - start, end);
+	for (i = start; i < end; i++) {
+		GhVaEv *e = &g_vaj->e[i % GH_VAJ_N];
+
+		if (e->op == 'R')
+			ss_log("         #%u  ---- restore ----\n", i);
+		else if (e->op == 'A')
+			ss_log("         #%u  alloc %p +%lx type %lx -> %p, tid %lu, from %p\n", i,
+			       (void *)e->addr, (unsigned long)e->size, (unsigned long)e->how,
+			       (void *)e->ret, (unsigned long)e->tid, (void *)e->caller);
+		else
+			ss_log("         #%u  free  %p +%lx type %lx -> %s, tid %lu, from %p\n", i,
+			       (void *)e->addr, (unsigned long)e->size, (unsigned long)e->how,
+			       e->ret ? "ok" : "FAILED", (unsigned long)e->tid,
+			       (void *)e->caller);
+	}
+}
+
+/* D3D9SW_PHYSX=0 stops PhysX stepping: the scene keeps every actor, answers
+ * queries and takes new bodies, but nothing moves under simulation.
+ *
+ * Only for the PhysX3_x86.dll Haydee ships (3.3.4, the timestamp below), whose
+ * NpScene vtable sits at a known offset; any other build is left alone. Haydee
+ * steps synchronously - simulate(dt, NULL, NULL, 0, true) then
+ * fetchResults(true) at haydee.dll+171DFB - so with no completion task a
+ * skipped step has nothing waiting on it. */
+#define PX_TIMESTAMP 0x56b28579u
+#define PX_NPSCENE_VT 0x188c84u
+enum { PX_SLOT_SIMULATE = 54, PX_SLOT_CHECK = 57, PX_SLOT_FETCH = 58 };
+
+static void *g_px_real_sim, *g_px_real_check, *g_px_real_fetch;
+static int g_px_freeze = -1;
+static const char *g_px_status = "PhysX3_x86.dll not seen";
+static volatile LONG g_px_steps, g_px_skipped;
+/* Thread inside simulate..fetchResults, 0 when the scene is idle. Rewinds with
+ * the game on purpose: it describes the threads a restore brings back. */
+static volatile LONG g_px_busy;
+
+/* D3D9SW_PHYSX_TRACE=1 (default): every method table in PhysX3_x86.dll is
+ * routed through stubs that count calls arriving from outside the DLL and
+ * remember the caller. At each step, a method that had been quiet for
+ * PXT_QUIET steps and is called again gets a log line, so every-frame traffic
+ * stays silent and a one-off action (a jump, a body spawned or released) shows
+ * up with the game address that made it. Counters and stubs are excluded from
+ * saves: the tick count runs on through restores.
+ *
+ * This build has no RTTI, so tables are found as the .rdata addresses its code
+ * carries relocations for that start a run of code pointers (294 tables, 4346
+ * methods in 3.3.4). Labelled by RVA; NpScene's is named. */
+#define PXT_MAX 8192
+#define PXT_TABLES 1024
+#define PXT_STUB 64
+#define PXT_HOME 0x5FF00000u
+#define PXT_CODE_HOME 0x5FF40000u
+#define PXT_QUIET 8
+
+typedef struct {
+	volatile LONG n;
+	void *volatile caller;
+	void *real;
+	LONG seen, last;
+	unsigned rva, slot;
+} PxtSlot;
+
+typedef struct {
+	PxtSlot s[PXT_MAX];
+	LONG ns, nvt, tick;
+	DWORD t0;
+	unsigned start[PXT_TABLES];
+} PxTrace;
+
+static PxTrace *g_pxt;
+static unsigned char *g_pxt_code;
+static int g_pxt_held;
+
+static void pxt_where(void *a, char *out)
+{
+	HMODULE m = NULL;
+	char p[MAX_PATH];
+	const char *leaf = p;
+	int i;
+
+	if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			       (LPCSTR)a, &m) ||
+	    !GetModuleFileNameA(m, p, sizeof(p))) {
+		wsprintfA(out, "%p", a);
+		return;
+	}
+	for (i = 0; p[i]; i++)
+		if (p[i] == '\\' || p[i] == '/')
+			leaf = p + i + 1;
+	wsprintfA(out, "%s+%lX", leaf, (unsigned long)((uintptr_t)a - (uintptr_t)m));
+}
+
+/* step=1 advances the tick (called at each simulate); 0 just reports what the
+ * game called since, so a save or restore line has everything before it. */
+static void pxt_scan(int step)
+{
+	char line[480], item[160], at[96];
+	int k = 0;
+	LONG i, tick;
+
+	if (!g_pxt)
+		return;
+	tick = step ? ++g_pxt->tick : g_pxt->tick;
+	for (i = 0; i < g_pxt->ns; i++) {
+		PxtSlot *s = &g_pxt->s[i];
+		LONG n = s->n, d = n - s->seen;
+		int quiet, len;
+
+		if (!d)
+			continue;
+		s->seen = n;
+		quiet = tick - s->last > PXT_QUIET;
+		s->last = tick;
+		if (!quiet)
+			continue;
+		pxt_where(s->caller, at);
+		if (s->rva == PX_NPSCENE_VT)
+			len = wsprintfA(item, " NpScene[%u] x%ld from %s;", s->slot, (long)d, at);
+		else
+			len = wsprintfA(item, " vt%X[%u] x%ld from %s;", s->rva, s->slot, (long)d,
+					at);
+		if (k + len >= (int)sizeof(line) - 1) {
+			line[k] = 0;
+			ss_log("physx tick %ld, %lu ms:%s\n", (long)tick,
+			       (unsigned long)(GetTickCount() - g_pxt->t0), line);
+			k = 0;
+		}
+		memcpy(line + k, item, (size_t)len);
+		k += len;
+	}
+	if (k) {
+		line[k] = 0;
+		ss_log("physx tick %ld, %lu ms:%s\n", (long)tick,
+		       (unsigned long)(GetTickCount() - g_pxt->t0), line);
+	}
+}
+
+#if defined(__i386__) || defined(_M_IX86)
+/* D3D9SW_PHYSX_JOURNAL=1 (default off): every call the game makes into PhysX is
+ * written down - method, object, the first six argument words, caller, thread
+ * and what came back - to physx_journal.csv beside the log, at each report and
+ * when the buffer fills. Without symbols this is how the methods get names:
+ * a call whose return value turns up later as another call's object made that
+ * object. The return is caught by swapping the caller's return address for
+ * pxj_ret and keeping the real one on a per-thread stack, so callbacks that
+ * re-enter PhysX nest. Off by default: it costs a few hundred cycles a call. */
+#define PXJ_MAX (1 << 18)
+#define PXJ_DEPTH 64
+typedef struct {
+	unsigned slot, tid, self, caller, tick, ret, ret2, done;
+	unsigned a[6];
+} PxjRec;
+static PxjRec *g_pxj;
+static volatile LONG g_pxj_n;
+static LONG g_pxj_dumped;
+static __thread unsigned t_pxj_ret[PXJ_DEPTH], t_pxj_rec[PXJ_DEPTH];
+static __thread int t_pxj_depth;
+
+static void pxj_ret(void);
+
+/* f[0] the stub's slot (replaced by the real method), f[1] the return address,
+ * f[2..] the arguments; pushal left ecx (this) at f[-2]. */
+static void __cdecl pxj_enter(unsigned *f)
+{
+	PxtSlot *s = (PxtSlot *)(uintptr_t)f[0];
+	PxjRec *r;
+	LONG i;
+	int d = t_pxj_depth;
+
+	f[0] = (unsigned)(uintptr_t)s->real;
+	if (d >= PXJ_DEPTH || (i = InterlockedIncrement(&g_pxj_n) - 1) >= PXJ_MAX)
+		return;
+	r = &g_pxj[i];
+	r->slot = (unsigned)(s - g_pxt->s);
+	r->tid = GetCurrentThreadId();
+	r->self = f[-2];
+	r->caller = f[1];
+	r->tick = (unsigned)g_pxt->tick;
+	r->a[0] = f[2], r->a[1] = f[3], r->a[2] = f[4];
+	r->a[3] = f[5], r->a[4] = f[6], r->a[5] = f[7];
+	t_pxj_ret[d] = f[1];
+	t_pxj_rec[d] = (unsigned)i;
+	t_pxj_depth = d + 1;
+	f[1] = (unsigned)(uintptr_t)pxj_ret;
+}
+
+/* f[0] takes the real return address; the method's eax and edx sit in the
+ * pushal frame at f[-1] and f[-3]. Must not touch x87: a float result is in
+ * st0. */
+static void __cdecl pxj_leave(unsigned *f)
+{
+	int d = --t_pxj_depth;
+	PxjRec *r = &g_pxj[t_pxj_rec[d]];
+
+	f[0] = t_pxj_ret[d];
+	r->ret = f[-1];
+	r->ret2 = f[-3];
+	r->done = 1;
+}
+
+static void(__cdecl *volatile g_pxj_enter_fn)(unsigned *) = pxj_enter;
+static void(__cdecl *volatile g_pxj_leave_fn)(unsigned *) = pxj_leave;
+
+__attribute__((naked)) static void pxj_entry(void)
+{
+	__asm__ __volatile__("pushal\n\t"
+			     "leal 32(%%esp), %%eax\n\t"
+			     "pushl %%eax\n\t"
+			     "call *%0\n\t"
+			     "addl $4, %%esp\n\t"
+			     "popal\n\t"
+			     "ret\n\t"
+			     :
+			     : "m"(g_pxj_enter_fn)
+			     : "memory");
+}
+
+__attribute__((naked)) static void pxj_ret(void)
+{
+	__asm__ __volatile__("pushl $0\n\t"
+			     "pushal\n\t"
+			     "leal 32(%%esp), %%ecx\n\t"
+			     "pushl %%ecx\n\t"
+			     "call *%0\n\t"
+			     "addl $4, %%esp\n\t"
+			     "popal\n\t"
+			     "ret\n\t"
+			     :
+			     : "m"(g_pxj_leave_fn)
+			     : "memory");
+}
+
+static void pxj_dump(void)
+{
+	LONG n = g_pxj_n, i;
+	HANDLE f;
+	static char buf[1 << 16];
+	char at[96], line[400];
+	DWORD put;
+	int len, nb = 0;
+
+	if (!g_pxj)
+		return;
+	if (n > PXJ_MAX)
+		n = PXJ_MAX;
+	if (n <= g_pxj_dumped)
+		return;
+	f = CreateFileA("physx_journal.csv", FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
+			g_pxj_dumped ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (f == INVALID_HANDLE_VALUE)
+		return;
+	if (!g_pxj_dumped) {
+		len = wsprintfA(line, "i,tick,tid,table,slot,self,a0,a1,a2,a3,a4,a5,ret,ret2,caller\r\n");
+		WriteFile(f, line, (DWORD)len, &put, NULL);
+	}
+	for (i = g_pxj_dumped; i < n; i++) {
+		const PxjRec *r = &g_pxj[i];
+		const PxtSlot *s = &g_pxt->s[r->slot];
+
+		pxt_where((void *)(uintptr_t)r->caller, at);
+		len = wsprintfA(line, "%ld,%u,%u,%s%X,%u,%08X,%08X,%08X,%08X,%08X,%08X,%08X,", (long)i,
+				r->tick, r->tid, s->rva == PX_NPSCENE_VT ? "NpScene_" : "vt", s->rva,
+				s->slot, r->self, r->a[0], r->a[1], r->a[2], r->a[3], r->a[4],
+				r->a[5]);
+		if (r->done)
+			len += wsprintfA(line + len, "%08X,%08X,%s\r\n", r->ret, r->ret2, at);
+		else
+			len += wsprintfA(line + len, "-,-,%s\r\n", at);
+		if (nb + len > (int)sizeof(buf)) {
+			WriteFile(f, buf, (DWORD)nb, &put, NULL);
+			nb = 0;
+		}
+		memcpy(buf + nb, line, (size_t)len);
+		nb += len;
+	}
+	if (nb)
+		WriteFile(f, buf, (DWORD)nb, &put, NULL);
+	CloseHandle(f);
+	ss_log("physx journal: %ld call(s) written to physx_journal.csv (%ld this time)%s\n",
+	       (long)n, (long)(n - g_pxj_dumped),
+	       g_pxj_n > PXJ_MAX ? " - FULL, later calls not recorded" : "");
+	g_pxj_dumped = n;
+}
+
+/* cmp [esp],lo / jb count / cmp [esp],hi / jb skip
+ * count: push eax / mov eax,[esp+4] / mov [caller],eax / pop eax / lock inc [n]
+ *        and with the journal on: push slot / jmp pxj_entry
+ * skip:  jmp [real] */
+static void pxt_stub(unsigned char *c, PxtSlot *s, uintptr_t lo, uintptr_t hi)
+{
+	uintptr_t a;
+	int skip = g_pxj ? 46 : 36;
+
+	c[0] = 0x81, c[1] = 0x3C, c[2] = 0x24, memcpy(c + 3, &lo, 4);
+	c[7] = 0x72, c[8] = 9;
+	c[9] = 0x81, c[10] = 0x3C, c[11] = 0x24, memcpy(c + 12, &hi, 4);
+	c[16] = 0x72, c[17] = (unsigned char)(skip - 18);
+	c[18] = 0x50, c[19] = 0x8B, c[20] = 0x44, c[21] = 0x24, c[22] = 0x04;
+	a = (uintptr_t)&s->caller, c[23] = 0xA3, memcpy(c + 24, &a, 4);
+	c[28] = 0x58;
+	a = (uintptr_t)&s->n, c[29] = 0xF0, c[30] = 0xFF, c[31] = 0x05, memcpy(c + 32, &a, 4);
+	if (g_pxj) {
+		LONG rel = (LONG)((uintptr_t)pxj_entry - (uintptr_t)(c + 46));
+		a = (uintptr_t)s, c[36] = 0x68, memcpy(c + 37, &a, 4);
+		c[41] = 0xE9, memcpy(c + 42, &rel, 4);
+	}
+	a = (uintptr_t)&s->real, c[skip] = 0xFF, c[skip + 1] = 0x25, memcpy(c + skip + 2, &a, 4);
+}
+
+static int pxt_exec(const unsigned char *b, const IMAGE_NT_HEADERS *nt, uintptr_t v)
+{
+	const IMAGE_SECTION_HEADER *sh = IMAGE_FIRST_SECTION(nt);
+	unsigned i;
+
+	for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+		if ((sh[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) &&
+		    v >= (uintptr_t)b + sh[i].VirtualAddress &&
+		    v < (uintptr_t)b + sh[i].VirtualAddress + sh[i].Misc.VirtualSize)
+			return 1;
+	return 0;
+}
+
+static void pxt_wrap(const unsigned char *b, const IMAGE_NT_HEADERS *nt, unsigned rva,
+		     unsigned end, void **scene_vt)
+{
+	uintptr_t lo = (uintptr_t)b, hi = lo + nt->OptionalHeader.SizeOfImage;
+	void **vt = (void **)(b + rva);
+	unsigned n = 0, i;
+	DWORD old;
+
+	while (n < 400 && rva + 4 * n < end && pxt_exec(b, nt, (uintptr_t)vt[n]))
+		n++;
+	if (!n || !VirtualProtect(vt, n * sizeof(void *), PAGE_READWRITE, &old))
+		return;
+	for (i = 0; i < n && g_pxt->ns < PXT_MAX; i++) {
+		PxtSlot *s = &g_pxt->s[g_pxt->ns];
+		unsigned char *c = g_pxt_code + g_pxt->ns * PXT_STUB;
+
+		if (vt == scene_vt && i >= PX_SLOT_SIMULATE && i <= PX_SLOT_FETCH)
+			continue;
+		s->real = vt[i];
+		s->rva = rva;
+		s->slot = i;
+		s->last = -1000;
+		pxt_stub(c, s, lo, hi);
+		vt[i] = c;
+		g_pxt->ns++;
+	}
+	VirtualProtect(vt, n * sizeof(void *), old, &old);
+	g_pxt->nvt++;
+}
+
+static void pxt_install(const unsigned char *b, const IMAGE_NT_HEADERS *nt, void **scene_vt)
+{
+	const IMAGE_DATA_DIRECTORY *rd =
+		&nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+	const unsigned char *r = b + rd->VirtualAddress, *rend = r + rd->Size;
+	unsigned size = nt->OptionalHeader.SizeOfImage, nst = 0, i, j;
+
+	if (!gh_knob("D3D9SW_PHYSX_TRACE", 1) || !rd->VirtualAddress || !rd->Size ||
+	    IsBadReadPtr(r, rd->Size))
+		return;
+	/* Fixed homes, because PhysX's method tables rewind with the game and hold
+	 * stub addresses: a load from another launch must find the stubs where the
+	 * saving launch had them. The raw span stops short of PXT_HOME for this. */
+	g_pxt = r_va ? r_va((void *)PXT_HOME, sizeof(PxTrace), MEM_COMMIT | MEM_RESERVE,
+			    PAGE_READWRITE)
+		     : VirtualAlloc((void *)PXT_HOME, sizeof(PxTrace), MEM_COMMIT | MEM_RESERVE,
+				    PAGE_READWRITE);
+	g_pxt_code = r_va ? r_va((void *)PXT_CODE_HOME, PXT_MAX * PXT_STUB,
+				 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+			  : VirtualAlloc((void *)PXT_CODE_HOME, PXT_MAX * PXT_STUB,
+					 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!g_pxt || !g_pxt_code)
+		ss_log("physx trace: fixed home at %08X taken, tracer placed by the OS - "
+		       "a load from another launch will jump into the old stubs\n",
+		       PXT_HOME);
+	if (!g_pxt)
+		g_pxt = r_va ? r_va(NULL, sizeof(PxTrace), MEM_COMMIT | MEM_RESERVE,
+				    PAGE_READWRITE)
+			     : VirtualAlloc(NULL, sizeof(PxTrace), MEM_COMMIT | MEM_RESERVE,
+					    PAGE_READWRITE);
+	if (!g_pxt_code)
+		g_pxt_code = r_va ? r_va(NULL, PXT_MAX * PXT_STUB, MEM_COMMIT | MEM_RESERVE,
+					 PAGE_EXECUTE_READWRITE)
+				  : VirtualAlloc(NULL, PXT_MAX * PXT_STUB,
+						 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!g_pxt || !g_pxt_code) {
+		g_pxt = NULL;
+		return;
+	}
+	g_pxt->t0 = GetTickCount();
+	if (gh_knob("D3D9SW_PHYSX_JOURNAL", 0))
+		g_pxj = (PxjRec *)VirtualAlloc(NULL, PXJ_MAX * sizeof(PxjRec),
+					       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	/* Every absolute address in code is in the relocation list. Those that
+	 * point at a data word starting two or more code pointers are tables. */
+	while (r + 8 <= rend) {
+		const IMAGE_BASE_RELOCATION *blk = (const IMAGE_BASE_RELOCATION *)r;
+		const WORD *e = (const WORD *)(r + 8);
+		unsigned ne;
+
+		if (blk->SizeOfBlock < 8 || r + blk->SizeOfBlock > rend)
+			break;
+		ne = (blk->SizeOfBlock - 8) / 2;
+		for (i = 0; i < ne; i++) {
+			unsigned at = blk->VirtualAddress + (e[i] & 0xfff), t;
+			uintptr_t v;
+
+			if ((e[i] >> 12) != IMAGE_REL_BASED_HIGHLOW || at + 4 > size ||
+			    !pxt_exec(b, nt, (uintptr_t)b + at))
+				continue;
+			v = *(const uintptr_t *)(b + at);
+			if (v < (uintptr_t)b || v + 8 > (uintptr_t)b + size || (v & 3) ||
+			    pxt_exec(b, nt, v) || !pxt_exec(b, nt, ((const uintptr_t *)v)[0]) ||
+			    !pxt_exec(b, nt, ((const uintptr_t *)v)[1]))
+				continue;
+			t = (unsigned)(v - (uintptr_t)b);
+			for (j = 0; j < nst && g_pxt->start[j] != t; j++)
+				;
+			if (j == nst && nst < PXT_TABLES)
+				g_pxt->start[nst++] = t;
+		}
+		r += blk->SizeOfBlock;
+	}
+	for (i = 1; i < nst; i++)
+		for (j = i; j && g_pxt->start[j - 1] > g_pxt->start[j]; j--) {
+			unsigned t = g_pxt->start[j];
+
+			g_pxt->start[j] = g_pxt->start[j - 1];
+			g_pxt->start[j - 1] = t;
+		}
+	for (i = 0; i < nst; i++)
+		pxt_wrap(b, nt, g_pxt->start[i], i + 1 < nst ? g_pxt->start[i + 1] : size,
+			 scene_vt);
+}
+#else
+static void pxt_install(const unsigned char *b, const IMAGE_NT_HEADERS *nt, void **scene_vt)
+{
+	(void)b, (void)nt, (void)scene_vt;
+}
+
+static void pxj_dump(void)
+{
+}
+#endif
+
+/* Called by the engine as a save or restore begins: waits out a step another
+ * thread is in the middle of, and puts the moment on the trace's timeline. */
+void gameheap_physx_quiet(const char *what, int slot)
+{
+	DWORD t0 = GetTickCount();
+	LONG tid = g_px_busy, me = (LONG)GetCurrentThreadId();
+	const char *how = "scene idle";
+	char b[64];
+
+	if (!g_px_real_sim)
+		return;
+	if (tid == me)
+		how = "called from inside a step";
+	else if (tid) {
+		while (g_px_busy && GetTickCount() - t0 < 500)
+			Sleep(1);
+		if (g_px_busy)
+			how = "a step was still running after 500 ms - went ahead";
+		else {
+			wsprintfA(b, "waited %lu ms for a step to finish",
+				  (unsigned long)(GetTickCount() - t0));
+			how = b;
+		}
+	}
+	pxt_scan(0);
+	ss_log("physx: %s slot %d at tick %ld, step %ld - %s\n", what, slot,
+	       g_pxt ? (long)g_pxt->tick : 0L, (long)g_px_steps, how);
+}
+
+void gameheap_physx_restored(void)
+{
+	if (!g_px_real_sim)
+		return;
+	ss_log("physx: restored at tick %ld, back to step %ld; the scene came back %s\n",
+	       g_pxt ? (long)g_pxt->tick : 0L, (long)g_px_steps,
+	       g_px_busy ? "MID-STEP" : "idle");
+}
+
+static void __thiscall px_simulate(void *self, float dt, void *task, void *scratch,
+				   unsigned scratch_n, int control)
+{
+	pxt_scan(1);
+	if (g_px_freeze) {
+		InterlockedIncrement(&g_px_skipped);
+		return;
+	}
+	InterlockedIncrement(&g_px_steps);
+	g_px_busy = (LONG)GetCurrentThreadId();
+	((void(__thiscall *)(void *, float, void *, void *, unsigned, int))g_px_real_sim)(
+		self, dt, task, scratch, scratch_n, control);
+}
+
+static unsigned char __thiscall px_check(void *self, int block)
+{
+	if (g_px_freeze)
+		return 1;
+	return ((unsigned char(__thiscall *)(void *, int))g_px_real_check)(self, block);
+}
+
+static unsigned char __thiscall px_fetch(void *self, int block, unsigned *err)
+{
+	unsigned char r;
+
+	if (g_px_freeze) {
+		if (err)
+			*err = 0;
+		return 1;
+	}
+	r = ((unsigned char(__thiscall *)(void *, int, unsigned *))g_px_real_fetch)(self, block,
+										    err);
+	if (r)
+		g_px_busy = 0;
+	return r;
+}
+
+static void gh_physx_hook(HMODULE mod, const WCHAR *path)
+{
+	const unsigned char *b = (const unsigned char *)mod;
+	const IMAGE_NT_HEADERS *nt;
+	void **vt;
+	DWORD old;
+	const WCHAR *leaf = path;
+	unsigned i;
+
+	for (i = 0; path[i]; i++)
+		if (path[i] == '\\' || path[i] == '/')
+			leaf = path + i + 1;
+	if (lstrcmpiW(leaf, L"PhysX3_x86.dll") || g_px_real_sim)
+		return;
+	if (g_px_freeze < 0)
+		g_px_freeze = gh_knob("D3D9SW_PHYSX", 1) == 0;
+	nt = (const IMAGE_NT_HEADERS *)(b + ((const IMAGE_DOS_HEADER *)b)->e_lfanew);
+	if (nt->FileHeader.TimeDateStamp != PX_TIMESTAMP) {
+		g_px_status = "PhysX3_x86.dll is not the 3.3.4 build this knows - left alone";
+		return;
+	}
+	vt = (void **)(b + PX_NPSCENE_VT);
+	if (vt[0] != (void *)(b + 0x4a600) || vt[1] != (void *)(b + 0x449e0) ||
+	    vt[PX_SLOT_SIMULATE] != (void *)(b + 0x45bb0) ||
+	    vt[PX_SLOT_CHECK] != (void *)(b + 0x45d50) ||
+	    vt[PX_SLOT_FETCH] != (void *)(b + 0x45d90)) {
+		g_px_status = "PhysX scene vtable not where expected - left alone";
+		return;
+	}
+	pxt_install(b, nt, vt);
+	if (!VirtualProtect(&vt[PX_SLOT_SIMULATE], 5 * sizeof(void *), PAGE_READWRITE, &old)) {
+		g_px_status = "PhysX scene vtable could not be made writable - left alone";
+		return;
+	}
+	g_px_real_sim = vt[PX_SLOT_SIMULATE];
+	g_px_real_check = vt[PX_SLOT_CHECK];
+	g_px_real_fetch = vt[PX_SLOT_FETCH];
+	vt[PX_SLOT_SIMULATE] = (void *)px_simulate;
+	vt[PX_SLOT_CHECK] = (void *)px_check;
+	vt[PX_SLOT_FETCH] = (void *)px_fetch;
+	VirtualProtect(&vt[PX_SLOT_SIMULATE], 5 * sizeof(void *), old, &old);
+	g_px_status = g_px_freeze ? "scene stepping OFF by D3D9SW_PHYSX=0" : "scene stepping on";
+}
+
+/* ---- OpenAL objects across a restore ---------------------------------------
+ * The game's audio lives in OpenAL32/wrap_oal from the system folder, which a
+ * restore leaves in the present. So after one, OpenAL still has every source and
+ * buffer the game made since the save (forgotten by the game, and leaking
+ * voices each time), lacks the ones it deleted since (still in use by the game),
+ * and its streaming queues no longer match what the game will unqueue.
+ *
+ * Two records of the same objects: g_al_game in our image's data, which rewinds
+ * with the game and so always says what the game believes, and g_al_real, held
+ * in the present, which says what OpenAL has. After a restore the first AL call
+ * the game makes brings OpenAL back in line - on the game's own thread, never
+ * from inside the restore, where a suspended thread may hold OpenAL's lock.
+ * Deletes are held back (stopped and emptied) while any save exists, so a
+ * restore has something to bring back. D3D9SW_REWIND_AL=0 turns it off. */
+#define AL_SOURCE_STATE 0x1010
+#define AL_PLAYING 0x1012
+#define AL_BUFFER 0x1009
+#define AL_MAXQ 16
+#define AL_NSRC 1024u
+#define AL_NBUF 8192u
+#define AL_NPROP 12
+#define AL_NLPROP 8
+
+/* The last value the game set for one property; is_int marks alSourcei's. */
+typedef struct {
+	int param;
+	unsigned char n, is_int;
+	int iv;
+	float v[6];
+} AlProp;
+
+typedef struct {
+	unsigned id;
+	unsigned char live, parked, is_static;
+	int state;
+	int nq;
+	unsigned q[AL_MAXQ];
+	int np;
+	AlProp p[AL_NPROP];
+} AlSrc;
+/* data: in g_al_game only, a copy of what the game last uploaded, on the game
+ * heap so it comes back with a restore - another launch's OpenAL never saw it. */
+typedef struct {
+	unsigned id;
+	unsigned char live, parked;
+	int fmt, size, freq, cap;
+	void *data;
+} AlBuf;
+typedef struct {
+	AlSrc s[AL_NSRC];
+	AlBuf b[AL_NBUF];
+	int nlp;
+	AlProp lp[AL_NLPROP];
+	LONG full;
+} AlTab;
+/* A game id from another launch, and the object made for it in this one. */
+typedef struct {
+	unsigned g, r;
+} AlMap;
+typedef struct {
+	AlTab t;
+	volatile LONG lock, pending, purge, trace;
+	unsigned nsm, nbm;
+	AlMap sm[AL_NSRC], bm[AL_NBUF];
+} AlReal;
+
+static AlTab g_al_game;
+static AlReal *g_al_real;
+_Static_assert(sizeof(AlReal) <= 0x5FEE0000u - GH_HOME_AL, "AlReal outgrew its home");
+static int g_al_held;
+
+static void(__cdecl *r_alGenSources)(int, unsigned *);
+static void(__cdecl *r_alDeleteSources)(int, const unsigned *);
+static void(__cdecl *r_alGenBuffers)(int, unsigned *);
+static void(__cdecl *r_alDeleteBuffers)(int, const unsigned *);
+static void(__cdecl *r_alSourceQueueBuffers)(unsigned, int, const unsigned *);
+static void(__cdecl *r_alSourceUnqueueBuffers)(unsigned, int, unsigned *);
+static void(__cdecl *r_alSourcei)(unsigned, int, int);
+static void(__cdecl *r_alSourcePlay)(unsigned);
+static void(__cdecl *r_alSourceStop)(unsigned);
+static void(__cdecl *r_alGetSourcei)(unsigned, int, int *);
+static void(__cdecl *r_alSourcef)(unsigned, int, float);
+static void(__cdecl *r_alSource3f)(unsigned, int, float, float, float);
+static void(__cdecl *r_alSourcefv)(unsigned, int, const float *);
+static void(__cdecl *r_alListenerf)(int, float);
+static void(__cdecl *r_alListenerfv)(int, const float *);
+static int(__cdecl *r_alGetError)(void);
+static char(__cdecl *r_alIsSource)(unsigned);
+static char(__cdecl *r_alIsBuffer)(unsigned);
+static void(__cdecl *r_alBufferData)(unsigned, int, const void *, int, int);
+static void(__cdecl *r_alBufferi)(unsigned, int, int);
+
+int savestate_any_valid(void);
+
+/* The game's AL calls for a while after each restore, which is where a source
+ * that comes back silent shows what the game did with it. */
+#define AL_TRACE_CALLS 150
+#define al_trace(...)                                          \
+	do {                                                   \
+		if (g_al_real->trace > 0) {                    \
+			g_al_real->trace--;                    \
+			ss_log("openal trace: " __VA_ARGS__); \
+		}                                              \
+	} while (0)
+
+static void al_prop_set(AlProp *p, int *np, int max, int param, int is_int, int iv, int n,
+			const float *v)
+{
+	int k;
+	AlProp *e = NULL;
+
+	for (k = 0; k < *np; k++)
+		if (p[k].param == param) {
+			e = &p[k];
+			break;
+		}
+	if (!e) {
+		if (*np >= max)
+			return;
+		e = &p[(*np)++];
+		e->param = param;
+	}
+	e->is_int = (unsigned char)is_int;
+	e->iv = iv;
+	e->n = (unsigned char)n;
+	for (k = 0; k < n; k++)
+		e->v[k] = v[k];
+}
+
+static void al_prop_apply_src(unsigned id, const AlProp *e)
+{
+	if (e->is_int)
+		r_alSourcei(id, e->param, e->iv);
+	else if (e->n == 3)
+		r_alSource3f(id, e->param, e->v[0], e->v[1], e->v[2]);
+	else
+		r_alSourcef(id, e->param, e->v[0]);
+}
+
+static void al_prop_apply_listener(const AlProp *e)
+{
+	if (e->n == 1)
+		r_alListenerf(e->param, e->v[0]);
+	else
+		r_alListenerfv(e->param, e->v);
+}
+
+static AlSrc *al_src(AlTab *t, unsigned id, int create)
+{
+	unsigned h = (id * 2654435761u) & (AL_NSRC - 1), i;
+	AlSrc *tomb = NULL;
+
+	for (i = 0; i < AL_NSRC; i++) {
+		AlSrc *e = &t->s[(h + i) & (AL_NSRC - 1)];
+		if (e->id == id && (e->live || e->parked))
+			return e;
+		if (!e->id)
+			break;
+		if (!e->live && !e->parked && !tomb)
+			tomb = e;
+	}
+	if (!create)
+		return NULL;
+	if (!tomb && i < AL_NSRC)
+		tomb = &t->s[(h + i) & (AL_NSRC - 1)];
+	if (!tomb) {
+		t->full++;
+		return NULL;
+	}
+	memset(tomb, 0, sizeof(*tomb));
+	tomb->id = id;
+	return tomb;
+}
+
+static AlBuf *al_buf(AlTab *t, unsigned id, int create)
+{
+	unsigned h = (id * 2654435761u) & (AL_NBUF - 1), i;
+	AlBuf *tomb = NULL;
+
+	for (i = 0; i < AL_NBUF; i++) {
+		AlBuf *e = &t->b[(h + i) & (AL_NBUF - 1)];
+		if (e->id == id && (e->live || e->parked))
+			return e;
+		if (!e->id)
+			break;
+		if (!e->live && !e->parked && !tomb)
+			tomb = e;
+	}
+	if (!create)
+		return NULL;
+	if (!tomb && i < AL_NBUF)
+		tomb = &t->b[(h + i) & (AL_NBUF - 1)];
+	if (!tomb) {
+		t->full++;
+		return NULL;
+	}
+	memset(tomb, 0, sizeof(*tomb));
+	tomb->id = id;
+	return tomb;
+}
+
+static void al_lock(void)
+{
+	while (InterlockedCompareExchange(&g_al_real->lock, 1, 0))
+		YieldProcessor();
+}
+
+static void al_unlock(void)
+{
+	InterlockedExchange(&g_al_real->lock, 0);
+}
+
+static void al_set_queue(AlSrc *s, const unsigned *q, int n, int is_static)
+{
+	int k;
+	if (!s)
+		return;
+	if (n > AL_MAXQ)
+		n = AL_MAXQ;
+	for (k = 0; k < n; k++)
+		s->q[k] = q[k];
+	s->nq = n;
+	s->is_static = (unsigned char)is_static;
+}
+
+static void al_queue_push(AlSrc *s, const unsigned *b, int n)
+{
+	int k;
+	for (k = 0; s && k < n && s->nq < AL_MAXQ; k++)
+		s->q[s->nq++] = b[k];
+	if (s)
+		s->is_static = 0;
+}
+
+static void al_queue_pop(AlSrc *s, int n)
+{
+	if (!s)
+		return;
+	if (n > s->nq)
+		n = s->nq;
+	memmove(s->q, s->q + n, (size_t)(s->nq - n) * sizeof(unsigned));
+	s->nq -= n;
+}
+
+/* Puts a source's queue and play state back to what the game believes. */
+static void al_reset_source(const AlSrc *g, AlSrc *r)
+{
+	r_alSourceStop(g->id);
+	r_alSourcei(g->id, AL_BUFFER, 0);
+	if (g->is_static && g->nq == 1)
+		r_alSourcei(g->id, AL_BUFFER, (int)g->q[0]);
+	else if (g->nq)
+		r_alSourceQueueBuffers(g->id, g->nq, g->q);
+	if (g->state == AL_PLAYING)
+		r_alSourcePlay(g->id);
+	memcpy(r->q, g->q, sizeof(r->q));
+	r->nq = g->nq;
+	r->is_static = g->is_static;
+	r->state = g->state;
+	r->live = 1;
+	r->parked = 0;
+}
+
+/* Called with the lock held, on whichever game thread touches OpenAL first. */
+static void al_reconcile(void)
+{
+	AlTab *R = &g_al_real->t, *G = &g_al_game;
+	unsigned i;
+	LONG src_gone = 0, buf_gone = 0, src_back = 0, src_reset = 0, buf_back = 0, props = 0;
+	int err;
+
+	for (i = 0; i < AL_NSRC; i++) {
+		AlSrc *r = &R->s[i];
+		AlSrc *g;
+		if (!r->id || (!r->live && !r->parked))
+			continue;
+		g = al_src(G, r->id, 0);
+		if (g && g->live)
+			continue;
+		r_alSourceStop(r->id);
+		r_alSourcei(r->id, AL_BUFFER, 0);
+		r_alDeleteSources(1, &r->id);
+		r->live = r->parked = 0;
+		src_gone++;
+	}
+	r_alGetError();
+	/* Sources before buffers: a buffer still queued on a source cannot be
+	 * deleted, and the reset below is what takes it off. */
+	for (i = 0; i < AL_NSRC; i++) {
+		const AlSrc *g = &G->s[i];
+		AlSrc *r;
+		int k, why = 0, rst, rnq;
+		if (!g->id || !g->live)
+			continue;
+		r = al_src(R, g->id, 0);
+		if (!r)
+			continue;
+		rst = r->state;
+		rnq = r->nq;
+		if (r->parked)
+			why = 1;
+		else if (r->nq != g->nq || r->state != g->state ||
+			 memcmp(r->q, g->q, (size_t)g->nq * sizeof(unsigned)))
+			why = 2;
+		if (why) {
+			al_reset_source(g, r);
+			if (why == 1)
+				src_back++;
+			else
+				src_reset++;
+		}
+		/* Volume, pitch, looping and position are whatever the present last
+		 * set, and the rewound game believes its own values are in effect. */
+		for (k = 0; k < g->np; k++)
+			al_prop_apply_src(g->id, &g->p[k]);
+		props += g->np;
+		if (why)
+			ss_log("openal:   source %u %s - game has it %s with %d queued%s, OpenAL "
+			       "had it %s with %d; %d setting(s) put back\n",
+			       g->id, why == 1 ? "brought back" : "re-queued",
+			       g->state == AL_PLAYING ? "playing" : "not playing", g->nq,
+			       g->is_static ? " (static)" : "",
+			       rst == AL_PLAYING ? "playing" : "not playing", rnq, g->np);
+	}
+	for (i = 0; i < (unsigned)G->nlp; i++)
+		al_prop_apply_listener(&G->lp[i]);
+	for (i = 0; i < AL_NBUF; i++) {
+		AlBuf *r = &R->b[i];
+		AlBuf *g;
+		if (!r->id || (!r->live && !r->parked))
+			continue;
+		g = al_buf(G, r->id, 0);
+		if (g && g->live) {
+			if (r->parked) {
+				r->parked = 0;
+				r->live = 1;
+				buf_back++;
+			}
+			continue;
+		}
+		r_alDeleteBuffers(1, &r->id);
+		r->live = r->parked = 0;
+		buf_gone++;
+	}
+	err = r_alGetError();
+	ss_log("openal: after the restore - %ld source(s) and %ld buffer(s) made since the "
+	       "save deleted, %ld source(s) and %ld buffer(s) deleted since brought back, "
+	       "%ld source(s) re-queued to match the game, %ld source and %d listener "
+	       "setting(s) put back%s; OpenAL error after: %04X\n",
+	       (long)src_gone, (long)buf_gone, (long)src_back, (long)buf_back,
+	       (long)src_reset, (long)props, G->nlp,
+	       (R->full || G->full) ? " (a table filled; some untracked)" : "", err);
+	g_al_real->trace = AL_TRACE_CALLS;
+}
+
+/* Deletes held back for a save that has since been replaced. */
+static void al_purge(void)
+{
+	AlTab *R = &g_al_real->t;
+	unsigned i;
+
+	for (i = 0; i < AL_NSRC; i++)
+		if (R->s[i].parked) {
+			r_alDeleteSources(1, &R->s[i].id);
+			R->s[i].parked = 0;
+		}
+	for (i = 0; i < AL_NBUF; i++)
+		if (R->b[i].parked) {
+			r_alDeleteBuffers(1, &R->b[i].id);
+			R->b[i].parked = 0;
+		}
+}
+
+/* Ids from another launch. This OpenAL hands out pointers as ids, so a game
+ * restored from another process names sources and buffers that do not exist
+ * here. The first time the game uses such an id it gets an object of its own,
+ * and every call after is translated. Called with the lock held. */
+static unsigned al_xb(unsigned g)
+{
+	unsigned k, r = 0;
+
+	if (!g)
+		return 0;
+	for (k = 0; k < g_al_real->nbm; k++)
+		if (g_al_real->bm[k].g == g)
+			return g_al_real->bm[k].r;
+	if (r_alIsBuffer(g))
+		return g;
+	r_alGenBuffers(1, &r);
+	if (!r || g_al_real->nbm >= AL_NBUF)
+		return r ? r : g;
+	g_al_real->bm[g_al_real->nbm].g = g;
+	g_al_real->bm[g_al_real->nbm++].r = r;
+	{
+		AlBuf *rb = al_buf(&g_al_real->t, r, 1), *gb = al_buf(&g_al_game, g, 0);
+		if (rb)
+			rb->live = 1;
+		if (gb && gb->data)
+			r_alBufferData(r, gb->fmt, gb->data, gb->size, gb->freq);
+		al_trace("buffer %u is from another launch - now buffer %u, %d byte(s) put back\n",
+			 g, r, gb && gb->data ? gb->size : 0);
+	}
+	return r;
+}
+
+static unsigned al_xb_back(unsigned r)
+{
+	unsigned k;
+
+	for (k = 0; k < g_al_real->nbm; k++)
+		if (g_al_real->bm[k].r == r)
+			return g_al_real->bm[k].g;
+	return r;
+}
+
+static unsigned al_xs(unsigned g)
+{
+	unsigned k, r = 0, q[AL_MAXQ];
+	const AlSrc *gs;
+	AlSrc *rs;
+	int i;
+
+	if (!g)
+		return 0;
+	for (k = 0; k < g_al_real->nsm; k++)
+		if (g_al_real->sm[k].g == g)
+			return g_al_real->sm[k].r;
+	if (r_alIsSource(g))
+		return g;
+	r_alGenSources(1, &r);
+	if (!r || g_al_real->nsm >= AL_NSRC)
+		return r ? r : g;
+	g_al_real->sm[g_al_real->nsm].g = g;
+	g_al_real->sm[g_al_real->nsm++].r = r;
+	/* Settings, queue and play state as the game believes them; a queued
+	 * buffer comes back empty, finishes at once, and the stream refills it. */
+	gs = al_src(&g_al_game, g, 0);
+	rs = al_src(&g_al_real->t, r, 1);
+	if (rs)
+		rs->live = 1;
+	if (gs) {
+		for (i = 0; i < gs->np; i++)
+			al_prop_apply_src(r, &gs->p[i]);
+		for (i = 0; i < gs->nq; i++)
+			q[i] = al_xb(gs->q[i]);
+		if (gs->is_static && gs->nq == 1)
+			r_alSourcei(r, AL_BUFFER, (int)q[0]);
+		else if (gs->nq)
+			r_alSourceQueueBuffers(r, gs->nq, q);
+		if (rs) {
+			memcpy(rs->q, q, (size_t)gs->nq * sizeof(unsigned));
+			rs->nq = gs->nq;
+			rs->is_static = gs->is_static;
+			rs->state = gs->state;
+		}
+		if (gs->state == AL_PLAYING)
+			r_alSourcePlay(r);
+	}
+	r_alGetError();
+	al_trace("source %u is from another launch - now source %u (%d queued, %s)\n", g, r,
+		 gs ? gs->nq : 0, gs && gs->state == AL_PLAYING ? "playing" : "stopped");
+	return r;
+}
+
+/* The mapped id without making one, for deletes. */
+static unsigned al_xs_find(unsigned g, int drop)
+{
+	unsigned k;
+
+	for (k = 0; k < g_al_real->nsm; k++)
+		if (g_al_real->sm[k].g == g) {
+			unsigned r = g_al_real->sm[k].r;
+			if (drop)
+				g_al_real->sm[k] = g_al_real->sm[--g_al_real->nsm];
+			return r;
+		}
+	return g;
+}
+
+static unsigned al_xb_find(unsigned g, int drop)
+{
+	unsigned k;
+
+	for (k = 0; k < g_al_real->nbm; k++)
+		if (g_al_real->bm[k].g == g) {
+			unsigned r = g_al_real->bm[k].r;
+			if (drop)
+				g_al_real->bm[k] = g_al_real->bm[--g_al_real->nbm];
+			return r;
+		}
+	return g;
+}
+
+static void al_enter(void)
+{
+	al_lock();
+	if (g_al_real->pending) {
+		g_al_real->pending = 0;
+		al_reconcile();
+	} else if (g_al_real->purge && !savestate_any_valid()) {
+		g_al_real->purge = 0;
+		al_purge();
+	}
+}
+
+static void __cdecl h_alGenSources(int n, unsigned *ids)
+{
+	int k;
+	al_enter();
+	r_alGenSources(n, ids);
+	for (k = 0; k < n; k++) {
+		AlSrc *r = al_src(&g_al_real->t, ids[k], 1), *g = al_src(&g_al_game, ids[k], 1);
+		if (r)
+			r->live = 1;
+		if (g)
+			g->live = 1;
+	}
+	al_unlock();
+}
+
+static void __cdecl h_alDeleteSources(int n, const unsigned *ids)
+{
+	int k, keep = savestate_any_valid();
+	al_enter();
+	for (k = 0; k < n; k++) {
+		unsigned rid = al_xs_find(ids[k], 1);
+		AlSrc *g = al_src(&g_al_game, ids[k], 0), *r = al_src(&g_al_real->t, rid, 0);
+		if (g)
+			g->live = 0;
+		if (keep && r) {
+			r_alSourceStop(rid);
+			r_alSourcei(rid, AL_BUFFER, 0);
+			r->nq = 0;
+			r->live = 0;
+			r->parked = 1;
+			g_al_real->purge = 1;
+		} else {
+			if (r)
+				r->live = r->parked = 0;
+			r_alDeleteSources(1, &rid);
+		}
+	}
+	al_unlock();
+}
+
+static void __cdecl h_alGenBuffers(int n, unsigned *ids)
+{
+	int k;
+	al_enter();
+	r_alGenBuffers(n, ids);
+	for (k = 0; k < n; k++) {
+		AlBuf *r = al_buf(&g_al_real->t, ids[k], 1), *g = al_buf(&g_al_game, ids[k], 1);
+		if (r)
+			r->live = 1;
+		if (g)
+			g->live = 1;
+	}
+	al_unlock();
+}
+
+static void __cdecl h_alDeleteBuffers(int n, const unsigned *ids)
+{
+	int k, keep = savestate_any_valid();
+	al_enter();
+	for (k = 0; k < n; k++) {
+		unsigned rid = al_xb_find(ids[k], 1);
+		AlBuf *g = al_buf(&g_al_game, ids[k], 0), *r = al_buf(&g_al_real->t, rid, 0);
+		if (g) {
+			g->live = 0;
+			if (g->data)
+				gh_free(g->data);
+			g->data = NULL;
+			g->cap = g->size = 0;
+		}
+		if (keep && r) {
+			r->live = 0;
+			r->parked = 1;
+			g_al_real->purge = 1;
+		} else {
+			if (r)
+				r->live = r->parked = 0;
+			r_alDeleteBuffers(1, &rid);
+		}
+	}
+	al_unlock();
+}
+
+static void __cdecl h_alSourceQueueBuffers(unsigned src, int n, const unsigned *b)
+{
+	unsigned rs, rb[64];
+	int k;
+	al_enter();
+	rs = al_xs(src);
+	if (!b || n <= 0 || n > 64) {
+		r_alSourceQueueBuffers(rs, n, b);
+		al_unlock();
+		return;
+	}
+	for (k = 0; k < n; k++)
+		rb[k] = al_xb(b[k]);
+	r_alSourceQueueBuffers(rs, n, rb);
+	al_queue_push(al_src(&g_al_real->t, rs, 0), rb, n);
+	al_queue_push(al_src(&g_al_game, src, 0), b, n);
+	al_trace("queue source %u +%d buffer(s) (first %u)\n", src, n, n > 0 ? b[0] : 0);
+	al_unlock();
+}
+
+static void __cdecl h_alSourceUnqueueBuffers(unsigned src, int n, unsigned *b)
+{
+	unsigned tmp[64] = { 0 }, rs;
+	int k, done;
+	al_enter();
+	rs = al_xs(src);
+	/* OpenAL refuses an unqueue of more than have finished and writes nothing
+	 * out, so an id coming back is what says it happened. Into our own array:
+	 * games pass their list of stream buffers here, and a refused call must
+	 * leave it as it was. */
+	if (!b || n <= 0 || n > 64) {
+		r_alSourceUnqueueBuffers(rs, n, b);
+		al_unlock();
+		return;
+	}
+	r_alSourceUnqueueBuffers(rs, n, tmp);
+	done = tmp[0] != 0;
+	if (done) {
+		for (k = 0; k < n; k++)
+			b[k] = al_xb_back(tmp[k]);
+		al_queue_pop(al_src(&g_al_real->t, rs, 0), n);
+		al_queue_pop(al_src(&g_al_game, src, 0), n);
+	}
+	al_trace("unqueue source %u %d buffer(s)%s\n", src, n, done ? "" : " - refused");
+	al_unlock();
+}
+
+static void __cdecl h_alSourcei(unsigned src, int param, int v)
+{
+	unsigned rs;
+	al_enter();
+	rs = al_xs(src);
+	r_alSourcei(rs, param, param == AL_BUFFER ? (int)al_xb((unsigned)v) : v);
+	if (param == AL_BUFFER) {
+		unsigned b = (unsigned)v, rb = al_xb(b);
+		al_set_queue(al_src(&g_al_real->t, rs, 0), &rb, v ? 1 : 0, 1);
+		al_set_queue(al_src(&g_al_game, src, 0), &b, v ? 1 : 0, 1);
+	} else {
+		AlSrc *g = al_src(&g_al_game, src, 0);
+		if (g)
+			al_prop_set(g->p, &g->np, AL_NPROP, param, 1, v, 0, NULL);
+	}
+	al_trace("source %u int %04X = %d\n", src, param, v);
+	al_unlock();
+}
+
+static void al_note_src_prop(unsigned src, int param, int n, const float *v)
+{
+	AlSrc *g = al_src(&g_al_game, src, 0);
+	if (g)
+		al_prop_set(g->p, &g->np, AL_NPROP, param, 0, 0, n, v);
+}
+
+static void __cdecl h_alSourcef(unsigned src, int param, float v)
+{
+	al_enter();
+	r_alSourcef(al_xs(src), param, v);
+	al_note_src_prop(src, param, 1, &v);
+	if (param == 0x100A)
+		al_trace("source %u gain = %d/1000\n", src, (int)(v * 1000.0f));
+	al_unlock();
+}
+
+static void __cdecl h_alSource3f(unsigned src, int param, float x, float y, float z)
+{
+	float v[3] = { x, y, z };
+	al_enter();
+	r_alSource3f(al_xs(src), param, x, y, z);
+	al_note_src_prop(src, param, 3, v);
+	al_unlock();
+}
+
+/* Of the float vectors a source takes, position, direction and velocity are
+ * the three-element ones; the rest are scalars passed by address. */
+static void __cdecl h_alSourcefv(unsigned src, int param, const float *v)
+{
+	al_enter();
+	r_alSourcefv(al_xs(src), param, v);
+	if (v)
+		al_note_src_prop(src, param,
+				 (param == 0x1004 || param == 0x1005 || param == 0x1006) ? 3 : 1, v);
+	al_unlock();
+}
+
+static void __cdecl h_alListenerf(int param, float v)
+{
+	al_enter();
+	r_alListenerf(param, v);
+	al_prop_set(g_al_game.lp, &g_al_game.nlp, AL_NLPROP, param, 0, 0, 1, &v);
+	if (param == 0x100A)
+		al_trace("listener gain = %d/1000\n", (int)(v * 1000.0f));
+	al_unlock();
+}
+
+/* AL_ORIENTATION (0x100F) is six floats; position and velocity are three. */
+static void __cdecl h_alListenerfv(int param, const float *v)
+{
+	al_enter();
+	r_alListenerfv(param, v);
+	if (v)
+		al_prop_set(g_al_game.lp, &g_al_game.nlp, AL_NLPROP, param, 0, 0,
+			    param == 0x100F ? 6 : (param == 0x100A ? 1 : 3), v);
+	al_unlock();
+}
+
+static void al_note_state(unsigned src, int st)
+{
+	AlSrc *r = al_src(&g_al_real->t, al_xs_find(src, 0), 0), *g = al_src(&g_al_game, src, 0);
+	if (r)
+		r->state = st;
+	if (g)
+		g->state = st;
+}
+
+static void __cdecl h_alSourcePlay(unsigned src)
+{
+	al_enter();
+	r_alSourcePlay(al_xs(src));
+	al_note_state(src, AL_PLAYING);
+	al_trace("play source %u\n", src);
+	al_unlock();
+}
+
+static void __cdecl h_alSourceStop(unsigned src)
+{
+	al_enter();
+	r_alSourceStop(al_xs(src));
+	al_note_state(src, 0x1014);
+	al_trace("stop source %u\n", src);
+	al_unlock();
+}
+
+static void __cdecl h_alGetSourcei(unsigned src, int param, int *v)
+{
+	AlSrc *g;
+	al_enter();
+	r_alGetSourcei(al_xs(src), param, v);
+	if (param == AL_BUFFER && v)
+		*v = (int)al_xb_back((unsigned)*v);
+	if (param == AL_SOURCE_STATE && v) {
+		g = al_src(&g_al_game, src, 0);
+		if (g && g->state != *v)
+			al_trace("source %u state now %04X (was %04X)\n", src, *v, g->state);
+		al_note_state(src, *v);
+	}
+	al_unlock();
+}
+
+static void __cdecl h_alBufferData(unsigned b, int fmt, const void *data, int size, int freq)
+{
+	static int keep = -1;
+	AlBuf *gb;
+
+	if (keep < 0)
+		keep = (int)gh_knob("D3D9SW_AL_KEEP", 1);
+	al_enter();
+	r_alBufferData(al_xb(b), fmt, data, size, freq);
+	gb = keep && data && size > 0 ? al_buf(&g_al_game, b, 1) : NULL;
+	if (gb) {
+		if (gb->cap < size) {
+			if (gb->data)
+				gh_free(gb->data);
+			gb->data = gh_malloc_at((size_t)size, 0xA1DA7Au);
+			gb->cap = gb->data ? size : 0;
+		}
+		if (gb->data) {
+			memcpy(gb->data, data, (size_t)size);
+			gb->fmt = fmt;
+			gb->size = size;
+			gb->freq = freq;
+		}
+	}
+	al_unlock();
+}
+
+static void __cdecl h_alBufferi(unsigned b, int param, int v)
+{
+	al_enter();
+	r_alBufferi(al_xb(b), param, v);
+	al_unlock();
+}
+
+/* After a restore's copy; the work waits for the game's next AL call. */
+void gameheap_al_restored(void)
+{
+	if (g_al_real) {
+		/* Whoever held the lock in the present has just had its context replaced. */
+		InterlockedExchange(&g_al_real->lock, 0);
+		InterlockedExchange(&g_al_real->pending, 1);
+	}
+}
+
+static void gh_al_hook(HMODULE mod)
+{
+	static const struct {
+		const char *name;
+		void *ours;
+		void **real;
+	} fns[] = {
+		{ "alGenSources", (void *)h_alGenSources, (void **)&r_alGenSources },
+		{ "alDeleteSources", (void *)h_alDeleteSources, (void **)&r_alDeleteSources },
+		{ "alGenBuffers", (void *)h_alGenBuffers, (void **)&r_alGenBuffers },
+		{ "alDeleteBuffers", (void *)h_alDeleteBuffers, (void **)&r_alDeleteBuffers },
+		{ "alSourceQueueBuffers", (void *)h_alSourceQueueBuffers,
+		  (void **)&r_alSourceQueueBuffers },
+		{ "alSourceUnqueueBuffers", (void *)h_alSourceUnqueueBuffers,
+		  (void **)&r_alSourceUnqueueBuffers },
+		{ "alSourcei", (void *)h_alSourcei, (void **)&r_alSourcei },
+		{ "alSourcePlay", (void *)h_alSourcePlay, (void **)&r_alSourcePlay },
+		{ "alSourceStop", (void *)h_alSourceStop, (void **)&r_alSourceStop },
+		{ "alGetSourcei", (void *)h_alGetSourcei, (void **)&r_alGetSourcei },
+		{ "alSourcef", (void *)h_alSourcef, (void **)&r_alSourcef },
+		{ "alSource3f", (void *)h_alSource3f, (void **)&r_alSource3f },
+		{ "alSourcefv", (void *)h_alSourcefv, (void **)&r_alSourcefv },
+		{ "alListenerf", (void *)h_alListenerf, (void **)&r_alListenerf },
+		{ "alListenerfv", (void *)h_alListenerfv, (void **)&r_alListenerfv },
+		{ "alBufferData", (void *)h_alBufferData, (void **)&r_alBufferData },
+		{ "alBufferi", (void *)h_alBufferi, (void **)&r_alBufferi },
+		{ "alGetError", NULL, (void **)&r_alGetError },
+		{ "alIsSource", NULL, (void **)&r_alIsSource },
+		{ "alIsBuffer", NULL, (void **)&r_alIsBuffer },
+	};
+	HMODULE al = GetModuleHandleA("OpenAL32.dll");
+	unsigned k;
+
+	if (!al || !r_va || mod == g_self || !gh_knob("D3D9SW_REWIND_AL", 1))
+		return;
+	if (!g_al_real) {
+		g_al_real = (AlReal *)gh_home_alloc(GH_HOME_AL, sizeof(AlReal));
+		if (!g_al_real)
+			return;
+	}
+	for (k = 0; k < sizeof(fns) / sizeof(fns[0]); k++)
+		if (!*fns[k].real)
+			*fns[k].real = (void *)GetProcAddress(al, fns[k].name);
+	for (k = 0; k < sizeof(fns) / sizeof(fns[0]); k++)
+		if (!*fns[k].real)
+			return;
+	for (k = 0; k < sizeof(fns) / sizeof(fns[0]); k++)
+		if (fns[k].ours)
+			gh_iat_swap(mod, "OpenAL32.dll", fns[k].name, fns[k].ours, NULL);
+}
+
+/* The game's open C streams. A FILE lives in the runtime's own heap, which we
+ * leave in the present, so a load from another launch brings back the game's
+ * FILE pointers with nothing behind them. Path, mode and position are enough to
+ * open the stream again there and hand the game the new pointer. */
+#define GH_STREAM_MAX 64
+typedef struct {
+	void *f;
+	WCHAR path[MAX_PATH];
+	char mode[8];
+} GhStream;
+
+static GhStream g_streams[GH_STREAM_MAX];
+static volatile LONG g_streams_lock;
+static void *(__cdecl *r_fopen)(const char *, const char *);
+static int(__cdecl *r_fopen_s)(void **, const char *, const char *);
+static void *(__cdecl *r_wfopen)(const WCHAR *, const WCHAR *);
+static int(__cdecl *r_wfopen_s)(void **, const WCHAR *, const WCHAR *);
+static int(__cdecl *r_fclose)(void *);
+
+static void gh_stream_note(void *f, const WCHAR *wpath, const char *path, const WCHAR *wmode,
+			   const char *mode)
+{
+	int i, k;
+
+	if (!f)
+		return;
+	while (InterlockedCompareExchange(&g_streams_lock, 1, 0))
+		YieldProcessor();
+	for (i = 0; i < GH_STREAM_MAX && g_streams[i].f; i++)
+		;
+	if (i < GH_STREAM_MAX) {
+		g_streams[i].f = f;
+		if (wpath)
+			lstrcpynW(g_streams[i].path, wpath, MAX_PATH);
+		else if (!MultiByteToWideChar(CP_ACP, 0, path, -1, g_streams[i].path, MAX_PATH))
+			g_streams[i].path[0] = 0;
+		for (k = 0; k < 7 && (wmode ? wmode[k] : mode[k]); k++)
+			g_streams[i].mode[k] = (char)(wmode ? wmode[k] : mode[k]);
+		g_streams[i].mode[k] = 0;
+	}
+	InterlockedExchange(&g_streams_lock, 0);
+}
+
+static void *__cdecl gh_fopen(const char *path, const char *mode)
+{
+	void *f = r_fopen(path, mode);
+
+	if (path && mode)
+		gh_stream_note(f, NULL, path, NULL, mode);
+	return f;
+}
+
+static int __cdecl gh_fopen_s(void **out, const char *path, const char *mode)
+{
+	int e = r_fopen_s(out, path, mode);
+
+	if (!e && out && path && mode)
+		gh_stream_note(*out, NULL, path, NULL, mode);
+	return e;
+}
+
+static void *__cdecl gh_wfopen(const WCHAR *path, const WCHAR *mode)
+{
+	void *f = r_wfopen(path, mode);
+
+	if (path && mode)
+		gh_stream_note(f, path, NULL, mode, NULL);
+	return f;
+}
+
+static int __cdecl gh_wfopen_s(void **out, const WCHAR *path, const WCHAR *mode)
+{
+	int e = r_wfopen_s(out, path, mode);
+
+	if (!e && out && path && mode)
+		gh_stream_note(*out, path, NULL, mode, NULL);
+	return e;
+}
+
+static int __cdecl gh_fclose(void *f)
+{
+	int i;
+
+	while (InterlockedCompareExchange(&g_streams_lock, 1, 0))
+		YieldProcessor();
+	for (i = 0; i < GH_STREAM_MAX; i++)
+		if (g_streams[i].f == f)
+			g_streams[i].f = NULL;
+	InterlockedExchange(&g_streams_lock, 0);
+	return r_fclose(f);
+}
+
+static void *gh_crt_fn(const char *name)
+{
+	HMODULE crt = GetModuleHandleA("ucrtbase.dll");
+
+	return crt ? (void *)GetProcAddress(crt, name) : NULL;
+}
+
+/* Called with the game suspended, so no lock: a thread frozen holding it would
+ * never let go. The position comes from the _nolock teller for the same reason. */
+int gameheap_streams(uintptr_t *f, WCHAR (*path)[MAX_PATH], char (*mode)[8], long long *pos,
+		     int max)
+{
+	long long(__cdecl *tell)(void *) = (long long(__cdecl *)(void *))gh_crt_fn(
+		"_ftelli64_nolock");
+	int i, n = 0;
+
+	for (i = 0; i < GH_STREAM_MAX && n < max; i++) {
+		MEMORY_BASIC_INFORMATION mi;
+
+		if (!g_streams[i].f || !g_streams[i].path[0])
+			continue;
+		if (!VirtualQuery(g_streams[i].f, &mi, sizeof(mi)) || mi.State != MEM_COMMIT ||
+		    !(mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+			g_streams[i].f = NULL;
+			continue;
+		}
+		f[n] = (uintptr_t)g_streams[i].f;
+		lstrcpynW(path[n], g_streams[i].path, MAX_PATH);
+		memcpy(mode[n], g_streams[i].mode, 8);
+		pos[n] = tell ? tell(g_streams[i].f) : -1;
+		n++;
+	}
+	return n;
+}
+
+/* Writing modes come back as "r+", keeping b or t: the file already holds what
+ * the game wrote, and "w" would truncate it. */
+void *gameheap_stream_reopen(uintptr_t old, const WCHAR *path, const char *mode, long long pos)
+{
+	void *(__cdecl *open)(const WCHAR *, const WCHAR *) =
+		r_wfopen ? r_wfopen
+			 : (void *(__cdecl *)(const WCHAR *, const WCHAR *))gh_crt_fn("_wfopen");
+	int(__cdecl *seek)(void *, long long, int) =
+		(int(__cdecl *)(void *, long long, int))gh_crt_fn("_fseeki64");
+	WCHAR wm[8];
+	void *f;
+	int k, n = 0;
+
+	if (!open)
+		return NULL;
+	if (strchr(mode, 'w') || strchr(mode, 'a')) {
+		wm[n++] = 'r';
+		wm[n++] = '+';
+		if (strchr(mode, 'b'))
+			wm[n++] = 'b';
+		else if (strchr(mode, 't'))
+			wm[n++] = 't';
+	} else {
+		for (k = 0; mode[k] && n < 7; k++)
+			wm[n++] = (WCHAR)mode[k];
+	}
+	wm[n] = 0;
+	while (InterlockedCompareExchange(&g_streams_lock, 1, 0))
+		YieldProcessor();
+	for (k = 0; k < GH_STREAM_MAX; k++)
+		if ((uintptr_t)g_streams[k].f == old)
+			g_streams[k].f = NULL;
+	InterlockedExchange(&g_streams_lock, 0);
+	f = open(path, wm);
+	if (!f)
+		return NULL;
+	if (pos > 0 && seek)
+		seek(f, pos, 0);
+	gh_stream_note(f, path, NULL, NULL, mode);
+	return f;
+}
+
+static void gh_stream_hook(HMODULE mod)
+{
+	static const char *const dlls[] = { "api-ms-win-crt-stdio-l1-1-0.dll", "ucrtbase.dll" };
+	unsigned d;
+
+	if (mod == g_self || !gh_knob("D3D9SW_STREAMS", 1))
+		return;
+	for (d = 0; d < sizeof(dlls) / sizeof(dlls[0]); d++) {
+		gh_iat_swap(mod, dlls[d], "fopen", (void *)gh_fopen, (void **)&r_fopen);
+		gh_iat_swap(mod, dlls[d], "fopen_s", (void *)gh_fopen_s, (void **)&r_fopen_s);
+		gh_iat_swap(mod, dlls[d], "_wfopen", (void *)gh_wfopen, (void **)&r_wfopen);
+		gh_iat_swap(mod, dlls[d], "_wfopen_s", (void *)gh_wfopen_s, (void **)&r_wfopen_s);
+		gh_iat_swap(mod, dlls[d], "fclose", (void *)gh_fclose, (void **)&r_fclose);
+	}
+}
+
+/* Borderless instead of exclusive fullscreen. A GL game's fullscreen is a
+ * desktop-sized popup plus a display mode switch, and Haydee minimizes itself
+ * through ShowWindow whenever it loses focus. Without the mode switch and that
+ * one ShowWindow the popup is a borderless window that alt-tabs like any other.
+ * A minimize asked for by the user goes through DefWindowProc, not these. */
+static LONG WINAPI gh_cds(DEVMODEA *dm, DWORD flags)
+{
+	(void)dm;
+	(void)flags;
+	return DISP_CHANGE_SUCCESSFUL;
+}
+
+static BOOL(WINAPI *r_showwindow)(HWND, int);
+
+static BOOL WINAPI gh_showwindow(HWND h, int cmd)
+{
+	if (cmd == SW_MINIMIZE || cmd == SW_SHOWMINIMIZED || cmd == SW_SHOWMINNOACTIVE ||
+	    cmd == SW_FORCEMINIMIZE)
+		return IsWindowVisible(h);
+	return r_showwindow(h, cmd);
+}
+
+static void gh_window_hook(HMODULE mod, const WCHAR *path)
+{
+	int a, b;
+
+	if (mod == g_self || !gh_knob("D3D9SW_BORDERLESS", 0))
+		return;
+	a = gh_iat_swap(mod, NULL, "ChangeDisplaySettingsA", (void *)gh_cds, NULL);
+	b = gh_iat_swap(mod, NULL, "ShowWindow", (void *)gh_showwindow, (void **)&r_showwindow);
+	if (a > 0 || b > 0)
+		ss_log("gameheap: %ls - borderless, %d mode switch and %d ShowWindow import(s) "
+		       "taken over\n",
+		       path, a, b);
+}
+
+/* DirectInput's objects live in its own heap, which a load from another launch
+ * leaves in the present, so the game's saved device pointers lead nowhere. It
+ * gets proxies instead, handed out lowest-free-first from a fixed home and held
+ * out of the rewind: same creation order, same proxy address in every launch,
+ * each forwarding to whatever device is live here. */
+#define GH_HOME_DI 0x5FEE0000u
+#define GH_DI_MAX 64
+
+typedef struct {
+	const void *const *vt;
+	void *real;
+} GhDiProxy;
+
+typedef struct {
+	volatile LONG lock;
+	LONG made;
+	GhDiProxy p[GH_DI_MAX];
+} GhDiHome;
+
+static GhDiHome *g_di;
+static int g_di_held;
+static HRESULT(WINAPI *r_di8create)(HINSTANCE, DWORD, const GUID *, void **, void *);
+
+#if defined(__i386__) || defined(_M_IX86)
+/* this is the first stdcall argument: swap the proxy for the live object and
+ * jump into the live object's own method. */
+#define GH_DI_FWD(i)                                                                     \
+	__asm__(".text\n.globl _gh_di_fwd" #i "\n_gh_di_fwd" #i ":\n"                    \
+		"\tmovl 4(%esp), %eax\n\tmovl 4(%eax), %eax\n\tmovl %eax, 4(%esp)\n"     \
+		"\tmovl (%eax), %ecx\n\tjmp *" #i "*4(%ecx)\n");                          \
+	void gh_di_fwd##i(void);
+GH_DI_FWD(0) GH_DI_FWD(1) GH_DI_FWD(3) GH_DI_FWD(4) GH_DI_FWD(5) GH_DI_FWD(6)
+GH_DI_FWD(7) GH_DI_FWD(8) GH_DI_FWD(9) GH_DI_FWD(10) GH_DI_FWD(11) GH_DI_FWD(12)
+GH_DI_FWD(13) GH_DI_FWD(14) GH_DI_FWD(15) GH_DI_FWD(16) GH_DI_FWD(17) GH_DI_FWD(18)
+GH_DI_FWD(19) GH_DI_FWD(20) GH_DI_FWD(21) GH_DI_FWD(22) GH_DI_FWD(23) GH_DI_FWD(24)
+GH_DI_FWD(25) GH_DI_FWD(26) GH_DI_FWD(27) GH_DI_FWD(28) GH_DI_FWD(29) GH_DI_FWD(30)
+GH_DI_FWD(31)
+
+static ULONG WINAPI gh_di_release(GhDiProxy *self);
+static HRESULT WINAPI gh_di_createdevice(GhDiProxy *self, const GUID *g, void **out,
+					 void *outer);
+
+/* IDirectInput8A/W: 11 methods, CreateDevice at 3. */
+static const void *const g_di_vt8[11] = {
+	(void *)gh_di_fwd0, (void *)gh_di_fwd1,		(void *)gh_di_release,
+	(void *)gh_di_createdevice, (void *)gh_di_fwd4, (void *)gh_di_fwd5,
+	(void *)gh_di_fwd6, (void *)gh_di_fwd7,		(void *)gh_di_fwd8,
+	(void *)gh_di_fwd9, (void *)gh_di_fwd10,
+};
+
+/* IDirectInputDevice8A/W: 32 methods. */
+static const void *const g_di_vtdev[32] = {
+	(void *)gh_di_fwd0,  (void *)gh_di_fwd1,  (void *)gh_di_release, (void *)gh_di_fwd3,
+	(void *)gh_di_fwd4,  (void *)gh_di_fwd5,  (void *)gh_di_fwd6,	 (void *)gh_di_fwd7,
+	(void *)gh_di_fwd8,  (void *)gh_di_fwd9,  (void *)gh_di_fwd10,	 (void *)gh_di_fwd11,
+	(void *)gh_di_fwd12, (void *)gh_di_fwd13, (void *)gh_di_fwd14,	 (void *)gh_di_fwd15,
+	(void *)gh_di_fwd16, (void *)gh_di_fwd17, (void *)gh_di_fwd18,	 (void *)gh_di_fwd19,
+	(void *)gh_di_fwd20, (void *)gh_di_fwd21, (void *)gh_di_fwd22,	 (void *)gh_di_fwd23,
+	(void *)gh_di_fwd24, (void *)gh_di_fwd25, (void *)gh_di_fwd26,	 (void *)gh_di_fwd27,
+	(void *)gh_di_fwd28, (void *)gh_di_fwd29, (void *)gh_di_fwd30,	 (void *)gh_di_fwd31,
+};
+
+static void *gh_di_wrap(void *real, const void *const *vt, const char *what)
+{
+	int i;
+
+	while (InterlockedCompareExchange(&g_di->lock, 1, 0))
+		SwitchToThread();
+	for (i = 0; i < GH_DI_MAX && g_di->p[i].real; i++)
+		;
+	if (i < GH_DI_MAX) {
+		g_di->p[i].vt = vt;
+		g_di->p[i].real = real;
+		g_di->made++;
+	}
+	InterlockedExchange(&g_di->lock, 0);
+	if (i >= GH_DI_MAX) {
+		ss_log("dinput: out of proxies, %s %p handed out as it is\n", what, real);
+		return real;
+	}
+	ss_log("dinput: %s %p behind proxy %d at %p\n", what, real, i, (void *)&g_di->p[i]);
+	return &g_di->p[i];
+}
+
+static ULONG WINAPI gh_di_release(GhDiProxy *self)
+{
+	void *r = self->real;
+	ULONG n = ((ULONG(WINAPI *)(void *))(*(void ***)r)[2])(r);
+
+	if (!n)
+		self->real = NULL;
+	return n;
+}
+
+static HRESULT WINAPI gh_di_createdevice(GhDiProxy *self, const GUID *g, void **out,
+					 void *outer)
+{
+	void *r = self->real;
+	HRESULT hr = ((HRESULT(WINAPI *)(void *, const GUID *, void **, void *))(
+		*(void ***)r)[3])(r, g, out, outer);
+
+	if (SUCCEEDED(hr) && out && *out)
+		*out = gh_di_wrap(*out, g_di_vtdev, "device");
+	return hr;
+}
+
+static HRESULT WINAPI gh_di8create(HINSTANCE h, DWORD v, const GUID *riid, void **out,
+				   void *outer)
+{
+	HRESULT hr = r_di8create(h, v, riid, out, outer);
+
+	if (SUCCEEDED(hr) && out && *out && !outer)
+		*out = gh_di_wrap(*out, g_di_vt8, "IDirectInput8");
+	return hr;
+}
+
+static int gh_di_home(void)
+{
+	if (!g_di)
+		g_di = (GhDiHome *)gh_home_alloc(GH_HOME_DI, sizeof(GhDiHome));
+	return g_di != NULL;
+}
+
+/* CLSID_DirectInput8: what the game actually asks COM for. */
+static const GUID k_clsid_di8 = { 0x25E609E4, 0xB259, 0x11CF,
+				  { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+static HRESULT(WINAPI *r_cocreate)(const GUID *, void *, DWORD, const GUID *, void **);
+
+static HRESULT WINAPI gh_cocreate(const GUID *clsid, void *outer, DWORD ctx, const GUID *iid,
+				  void **out)
+{
+	HRESULT hr = r_cocreate(clsid, outer, ctx, iid, out);
+
+	if (SUCCEEDED(hr) && out && *out && !outer && clsid &&
+	    !memcmp(clsid, &k_clsid_di8, sizeof(GUID)) && gh_di_home()) {
+		ss_log("dinput: CoCreateInstance for interface %08lX\n",
+		       iid ? (unsigned long)iid->Data1 : 0ul);
+		*out = gh_di_wrap(*out, g_di_vt8, "IDirectInput8");
+	}
+	return hr;
+}
+
+static FARPROC WINAPI gh_getprocaddress(HMODULE m, LPCSTR name)
+{
+	FARPROC f = GetProcAddress(m, name);
+
+	if (f && ((ULONG_PTR)name >> 16) && !lstrcmpA(name, "DirectInput8Create")) {
+		if (gh_di_home()) {
+			r_di8create = (HRESULT(WINAPI *)(HINSTANCE, DWORD, const GUID *, void **,
+							 void *))(void *)f;
+			f = (FARPROC)(void *)gh_di8create;
+		}
+	}
+	return f;
+}
+
+static void gh_di_hook(HMODULE mod, const WCHAR *path)
+{
+	const WCHAR *leaf = path;
+	int i;
+
+	for (i = 0; path[i]; i++)
+		if (path[i] == '\\' || path[i] == '/')
+			leaf = path + i + 1;
+	/* Only the module that asks for DirectInput: launcher.exe carries Steam's
+	 * DRM, and a hooked import there ends the process before it starts. */
+	if (mod == g_self || lstrcmpiW(leaf, L"haydee.dll") || !gh_knob("D3D9SW_DIPROXY", 0))
+		return;
+	if (gh_iat_swap(mod, NULL, "GetProcAddress", (void *)gh_getprocaddress, NULL) > 0)
+		ss_log("gameheap: %ls - DirectInput8Create will hand out proxies\n", path);
+	if (gh_iat_swap(mod, NULL, "CoCreateInstance", (void *)gh_cocreate,
+			(void **)&r_cocreate) > 0)
+		ss_log("gameheap: %ls - CoCreateInstance(DirectInput8) will hand out proxies\n",
+		       path);
+}
+#else
+static void gh_di_hook(HMODULE mod, const WCHAR *path)
+{
+	(void)mod;
+	(void)path;
+}
+#endif
+
+/* game.dll is loaded late by launcher.exe and opts into ASLR, so it lands
+ * wherever the loader finds room - 69490000 in one launch, 69500000 in the next -
+ * and every restored pointer into it is then wrong. Its image is mapped as
+ * usual, recognised by name, and mapped again at a fixed home; the loader
+ * relocates any image not at its preferred base anyway. */
+#define GH_HOME_GAMEDLL 0x3FF00000u
+
+typedef LONG(NTAPI *PFN_GhNtMap)(HANDLE, HANDLE, PVOID *, ULONG_PTR, SIZE_T, PLARGE_INTEGER,
+				 PSIZE_T, DWORD, ULONG, ULONG);
+static PFN_GhNtMap r_ntmap;
+static LONG(NTAPI *r_ntunmap)(HANDLE, PVOID);
+static int g_gamedll_pinned;
+
+static LONG NTAPI gh_ntmap(HANDLE sec, HANDLE proc, PVOID *base, ULONG_PTR zb, SIZE_T commit,
+			   PLARGE_INTEGER off, PSIZE_T vsize, DWORD inh, ULONG at, ULONG prot)
+{
+	SIZE_T asked = vsize ? *vsize : 0;
+	int watch = !g_gamedll_pinned && proc == GetCurrentProcess() && base && !*base;
+	LONG st = r_ntmap(sec, proc, base, zb, commit, off, vsize, inh, at, prot);
+	MEMORY_BASIC_INFORMATION mbi;
+	WCHAR fn[MAX_PATH];
+	DWORD n;
+	PVOID was, home;
+	SIZE_T vs;
+	LONG st2;
+
+	if (!watch || st < 0 || !*base || !VirtualQuery(*base, &mbi, sizeof(mbi)) ||
+	    mbi.Type != MEM_IMAGE)
+		return st;
+	n = K32GetMappedFileNameW(GetCurrentProcess(), *base, fn, MAX_PATH);
+	if (n < 9 || lstrcmpiW(fn + n - 9, L"\\game.dll"))
+		return st;
+	g_gamedll_pinned = 1;
+	was = *base;
+	if ((uintptr_t)was == GH_HOME_GAMEDLL)
+		return st;
+	r_ntunmap(proc, was);
+	home = (PVOID)GH_HOME_GAMEDLL;
+	vs = asked;
+	st2 = r_ntmap(sec, proc, &home, zb, commit, off, &vs, inh, at, prot);
+	if (st2 >= 0) {
+		ss_log("gameheap: game.dll PINNED at %p (the loader chose %p)\n", home, was);
+		*base = home;
+	} else {
+		ss_log("gameheap: game.dll could not go to its home %08lX (status %08lX) - "
+		       "left where the loader puts it\n",
+		       (unsigned long)GH_HOME_GAMEDLL, (unsigned long)st2);
+		home = NULL;
+		vs = asked;
+		st2 = r_ntmap(sec, proc, &home, zb, commit, off, &vs, inh, at, prot);
+		*base = home;
+	}
+	if (vsize)
+		*vsize = vs;
+	return st2;
+}
+
+static void gh_gamedll_pin(void)
+{
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+
+	if (!gh_knob("D3D9SW_PIN_GAMEDLL", 1) || GetModuleHandleA("game.dll"))
+		return;
+	r_ntunmap = (LONG(NTAPI *)(HANDLE, PVOID))(void *)GetProcAddress(nt, "NtUnmapViewOfSection");
+	if (r_ntunmap)
+		ntdll_inline_hook("NtMapViewOfSection", (void *)gh_ntmap, (void **)&r_ntmap);
+}
+
+/* Handle values from another launch that something else holds here: the game's
+ * calls on them go to the stand-in the load made (savestate_hx). */
+HANDLE savestate_hx(HANDLE h);
+int savestate_hx_close(HANDLE h);
+
+static DWORD WINAPI gh_wfso(HANDLE h, DWORD ms)
+{
+	return WaitForSingleObject(savestate_hx(h), ms);
+}
+
+static DWORD WINAPI gh_wfsoex(HANDLE h, DWORD ms, BOOL alert)
+{
+	return WaitForSingleObjectEx(savestate_hx(h), ms, alert);
+}
+
+static DWORD WINAPI gh_wfmoex(DWORD n, const HANDLE *hs, BOOL all, DWORD ms, BOOL alert)
+{
+	HANDLE t[MAXIMUM_WAIT_OBJECTS];
+	DWORD k;
+
+	if (n > MAXIMUM_WAIT_OBJECTS || !hs)
+		return WaitForMultipleObjectsEx(n, hs, all, ms, alert);
+	for (k = 0; k < n; k++)
+		t[k] = savestate_hx(hs[k]);
+	return WaitForMultipleObjectsEx(n, t, all, ms, alert);
+}
+
+static DWORD WINAPI gh_wfmo(DWORD n, const HANDLE *hs, BOOL all, DWORD ms)
+{
+	return gh_wfmoex(n, hs, all, ms, FALSE);
+}
+
+static BOOL WINAPI gh_setevent(HANDLE h)
+{
+	return SetEvent(savestate_hx(h));
+}
+
+static BOOL WINAPI gh_resetevent(HANDLE h)
+{
+	return ResetEvent(savestate_hx(h));
+}
+
+static BOOL WINAPI gh_closehandle(HANDLE h)
+{
+	return savestate_hx_close(h) ? TRUE : CloseHandle(h);
+}
+
+static DWORD WINAPI gh_resumethread(HANDLE h)
+{
+	return ResumeThread(savestate_hx(h));
+}
+
+static BOOL WINAPI gh_setthreadpriority(HANDLE h, int p)
+{
+	return SetThreadPriority(savestate_hx(h), p);
+}
+
+static DWORD_PTR WINAPI gh_setthreadaffinity(HANDLE h, DWORD_PTR m)
+{
+	return SetThreadAffinityMask(savestate_hx(h), m);
+}
+
+static void gh_handle_hook(HMODULE mod)
+{
+	static const struct {
+		const char *name;
+		void *to;
+	} fns[] = {
+		{ "WaitForSingleObject", (void *)gh_wfso },
+		{ "WaitForSingleObjectEx", (void *)gh_wfsoex },
+		{ "WaitForMultipleObjects", (void *)gh_wfmo },
+		{ "WaitForMultipleObjectsEx", (void *)gh_wfmoex },
+		{ "SetEvent", (void *)gh_setevent },
+		{ "ResetEvent", (void *)gh_resetevent },
+		{ "CloseHandle", (void *)gh_closehandle },
+		{ "ResumeThread", (void *)gh_resumethread },
+		{ "SetThreadPriority", (void *)gh_setthreadpriority },
+		{ "SetThreadAffinityMask", (void *)gh_setthreadaffinity },
+	};
+	unsigned k;
+
+	if (mod == g_self || !gh_knob("D3D9SW_HX", 1))
+		return;
+	for (k = 0; k < sizeof(fns) / sizeof(fns[0]); k++)
+		gh_iat_swap(mod, NULL, fns[k].name, fns[k].to, NULL);
+}
+
+static void gh_patch_module(HMODULE mod, const WCHAR *path)
+{
+	unsigned f, d;
+	int total = 0, unbound = 0;
+
+	if (!gh_is_game_module(mod, path))
+		return;
+	gh_physx_hook(mod, path);
+	gh_al_hook(mod);
+	gh_stream_hook(mod);
+	gh_window_hook(mod, path);
+	gh_di_hook(mod, path);
+	gh_handle_hook(mod);
+	if (g_vaj && mod != g_self) {
+		gh_iat_swap(mod, NULL, "VirtualAlloc", (void *)gh_va_j, NULL);
+		gh_iat_swap(mod, NULL, "VirtualFree", (void *)gh_vf_j, NULL);
+	}
+	if (mod != g_self) {
+		static const char *const rewound[] = { "QueryPerformanceCounter",
+						       "GetTickCount", "timeGetTime",
+						       "CreateEventA", "CreateEventW",
+						       "CreateThread" };
+		unsigned k;
+
+		for (k = 0; k < sizeof(rewound) / sizeof(rewound[0]); k++) {
+			void *to = savestate_game_import_hook(rewound[k]);
+
+			if (to)
+				gh_iat_swap(mod, NULL, rewound[k], to, NULL);
+		}
+	}
+	for (f = 0; f < sizeof(kImpFns) / sizeof(kImpFns[0]); f++)
+		for (d = 0; d < sizeof(kImpDlls) / sizeof(kImpDlls[0]); d++) {
+			int n = gh_iat_swap(mod, kImpDlls[d], kImpFns[f].name,
+					    kImpFns[f].ours, NULL);
+
+			if (n < 0)
+				unbound = 1;
+			else
+				total += n;
+		}
+	if (unbound) {
+		g_mods_unbound++;
+		ss_log("gameheap: %ls - imports not resolved yet, left alone\n", path);
+		return;
+	}
+	if (!total)
+		return;
+	g_mods_patched++;
+	g_slots_patched += (unsigned long)total;
+	ss_log("gameheap: %ls - %d allocator import(s) now on the private heap\n", path,
+	       total);
+}
+
+typedef struct {
+	USHORT len, cap;
+	PWSTR buf;
+} GhUStr;
+
+typedef struct {
+	ULONG flags;
+	GhUStr *full, *base;
+	PVOID dll_base;
+	ULONG size;
+} GhDllNote;
+
+/* Delivered after the new module's imports are bound and before its own
+ * initialisation runs (measured), which is the moment that matters: game.dll
+ * arrives by LoadLibrary long after attach, and patching it here means even its
+ * static constructors allocate from us. */
+static VOID CALLBACK gh_dll_loaded(ULONG reason, GhDllNote *d, PVOID ctx)
+{
+	WCHAR path[MAX_PATH];
+	unsigned n;
+
+	(void)ctx;
+	if (reason != 1 || !d || !d->full || !d->full->buf)
+		return;
+	n = d->full->len / sizeof(WCHAR);
+	if (n >= MAX_PATH)
+		return;
+	memcpy(path, d->full->buf, n * sizeof(WCHAR));
+	path[n] = 0;
+	gh_patch_module((HMODULE)d->dll_base, path);
+}
+
+static void gh_patch_loaded(void)
+{
+	HMODULE mods[512];
+	DWORD need = 0, i;
+	WCHAR path[MAX_PATH];
+
+	if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &need))
+		return;
+	need /= sizeof(HMODULE);
+	if (need > 512)
+		need = 512;
+	for (i = 0; i < need; i++)
+		if (GetModuleFileNameW(mods[i], path, MAX_PATH))
+			gh_patch_module(mods[i], path);
+}
+
+static void gh_add_range(uintptr_t lo, uintptr_t hi)
+{
+	LONG n = g_nreg;
+
+	if (n >= GH_REG || !hi)
+		return;
+	g_lo[n] = lo;
+	g_hi[n] = hi;
+	InterlockedIncrement(&g_nreg);
+}
+
+int gameheap_import_mode(void)
+{
+	return g_ready && g_imports;
+}
+
+/* The wrapper's own allocator (sw_malloc), served from the private heap in
+ * import mode. Its usual home is a growable HeapCreate heap, and a growable heap
+ * turns the low-fragmentation front end on, whose bookkeeping lives outside the
+ * region we rewind - the restore that first survived Haydee's audio died six
+ * frames later inside RtlAllocateHeap on exactly that heap. Same layout as
+ * sw_malloc (the issued block one word below the aligned address), and NULL
+ * rather than a runtime fallback when full, so the caller can tell whose block
+ * it holds from the block alone. */
+void *gameheap_sw_alloc(size_t n, size_t a)
+{
+	size_t want = n + a + sizeof(void *);
+	void *raw;
+	uintptr_t p;
+
+	if (!g_ready || !g_imports || want < n)
+		return NULL;
+	raw = want >= GH_BIG ? big_alloc(want + sizeof(GhHead))
+			     : gh_halloc(g_heap, 0, want + sizeof(GhHead));
+	if (!raw) {
+		g_fellback++;
+		return NULL;
+	}
+	raw = give(raw, want);
+	p = ((uintptr_t)raw + sizeof(void *) + a - 1) & ~(uintptr_t)(a - 1);
+	((void **)p)[-1] = raw;
+	return (void *)p;
+}
+
+/* Takes the issued block (the word below what sw_malloc returned). */
+int gameheap_sw_owns(void *raw)
+{
+	int orphan;
+
+	return g_ready && g_imports && ours_why(raw, &orphan) != NULL;
+}
+
+void gameheap_sw_free(void *raw)
+{
+	gh_free(raw);
+}
+
+size_t gameheap_sw_size(void *raw)
+{
+	int orphan;
+	GhHead *h = ours_why(raw, &orphan);
+
+	return h ? h->size : 0;
+}
+
+int gameheap_install_imports(void)
+{
+	char v[8];
+	DWORD n = savestate_getenv("D3D9SW_GAMEHEAP", v, sizeof(v));
+	HMODULE ucrt = GetModuleHandleA("ucrtbase.dll");
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+	LONG(NTAPI * reg)(ULONG, PVOID, PVOID, PVOID *);
+	unsigned big_mb = gh_knob("D3D9SW_GHBIG_MB", 64);
+	void *cookie = NULL;
+	int floor = 0, i;
+	WCHAR *slash = NULL;
+
+	if (g_ready || n == 0 || n >= sizeof(v) || v[0] != '2')
+		return 0;
+	g_early_on = 1;
+	g_imports = 1;
+	if (!ucrt) {
+		ss_log("gameheap: import mode asked for, but ucrtbase is not loaded - "
+		       "this game does not take its runtime from a DLL\n");
+		return 0;
+	}
+	r_malloc = (PFN_malloc)(void *)GetProcAddress(ucrt, "malloc");
+	r_calloc = (PFN_calloc)(void *)GetProcAddress(ucrt, "calloc");
+	r_realloc = (PFN_realloc)(void *)GetProcAddress(ucrt, "realloc");
+	r_free = (PFN_free)(void *)GetProcAddress(ucrt, "free");
+	r_msize = (PFN_msize)(void *)GetProcAddress(ucrt, "_msize");
+	r_recalloc = (PFN_recalloc)(void *)GetProcAddress(ucrt, "_recalloc");
+	r_expand = (PFN_expand)(void *)GetProcAddress(ucrt, "_expand");
+	if (!r_malloc || !r_calloc || !r_realloc || !r_free || !r_msize || !r_recalloc ||
+	    !r_expand) {
+		ss_log("gameheap: ucrtbase is missing an allocator export - nothing "
+		       "touched\n");
+		return 0;
+	}
+	GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			   (LPCSTR)(void *)gameheap_install_imports, &g_self);
+	g_game_dir_n = (int)GetModuleFileNameW(NULL, g_game_dir, MAX_PATH);
+	for (i = 0; i < g_game_dir_n; i++)
+		if (g_game_dir[i] == '\\' || g_game_dir[i] == '/')
+			slash = g_game_dir + i;
+	g_game_dir_n = slash ? (int)(slash - g_game_dir) + 1 : 0;
+
+	g_heap = gh_create_heap();
+	if (!g_heap || !g_heap_hi) {
+		ss_log("gameheap: import mode needs a heap at a reserved base, and did "
+		       "not get one - nothing redirected. A growable heap would bring the "
+		       "low-fragmentation bookkeeping back outside the region\n");
+		return 0;
+	}
+	InitializeCriticalSection(&g_cs);
+	gh_add_range(g_heap_lo, g_heap_hi);
+	gh_gamedll_pin();
+	if (big_mb) {
+		g_big_chunk = (SIZE_T)big_mb << 20;
+		bigpin_reserve();
+		/* Below our own image at 0x60000000: the game holds ~355 MB of these by
+		 * the title screen, more than fits above the big-block span. */
+		raw_reserve(0x40000000u, GH_HOMES);
+		if (chunk_add(0))
+			ss_log("gameheap: big blocks (%u KB and up) in %u MB chunks, first "
+			       "at %p\n",
+			       GH_BIG >> 10, big_mb, (void *)g_bigch[0]);
+		else
+			ss_log("gameheap: could not reserve a %u MB big-block chunk (error "
+			       "%lu) - will retry on the first big block\n",
+			       big_mb, GetLastError());
+	}
+
+	floor += gh_iat_swap(ucrt, NULL, "HeapFree", (void *)gh_heapfree,
+			     (void **)&r_heapfree) > 0;
+	floor += gh_iat_swap(ucrt, NULL, "HeapReAlloc", (void *)gh_crt_heaprealloc,
+			     (void **)&r_crt_hra) > 0;
+	floor += gh_iat_swap(ucrt, NULL, "HeapSize", (void *)gh_crt_heapsize,
+			     (void **)&r_crt_hsz) > 0;
+	if (floor != 3) {
+		ss_log("gameheap: only %d of ucrtbase's 3 heap imports could be "
+		       "patched - without the floor a block of ours freed inside the "
+		       "runtime would reach the process heap, so nothing is "
+		       "redirected\n",
+		       floor);
+		return 0;
+	}
+	g_ready = 1;
+	savestate_game_heap(g_heap);
+	{
+		HMODULE k32 = GetModuleHandleA("kernel32.dll");
+
+		r_va = k32 ? (LPVOID(WINAPI *)(LPVOID, SIZE_T, DWORD, DWORD))(void *)
+				     GetProcAddress(k32, "VirtualAlloc")
+			   : NULL;
+		r_vf = k32 ? (BOOL(WINAPI *)(LPVOID, SIZE_T, DWORD))(void *)GetProcAddress(
+				     k32, "VirtualFree")
+			   : NULL;
+		if (r_va && r_vf) {
+			g_vaj = (GhVaJ *)gh_home_alloc(GH_HOME_VAJ, sizeof(GhVaJ));
+			if (gh_knob("D3D9SW_GHRES", 1))
+				g_res = (GhRes *)gh_home_alloc(GH_HOME_RES, sizeof(GhRes));
+		}
+	}
+	if (gh_knob("D3D9SW_NTLOG", 0)) {
+		g_ntlog = 1;
+		nt_hooks_install(0);
+	}
+	gh_patch_loaded();
+	reg = nt ? (LONG(NTAPI *)(ULONG, PVOID, PVOID, PVOID *))(void *)GetProcAddress(
+			   nt, "LdrRegisterDllNotification")
+		 : NULL;
+	ss_log("gameheap: IMPORT MODE - %lu module(s), %lu import slot(s) on a private "
+	       "heap at %p (%u MB); ucrtbase's HeapFree/HeapReAlloc/HeapSize are the "
+	       "floor; later loads %s\n",
+	       g_mods_patched, g_slots_patched, (void *)g_heap, g_pin_mb,
+	       (reg && reg(0, (PVOID)gh_dll_loaded, NULL, &cookie) >= 0)
+		       ? "patched as they arrive"
+		       : "NOT WATCHED - LdrRegisterDllNotification failed");
+	return (int)g_slots_patched;
+}
+
 /* ------------------------------------------------- where the heap itself goes
  *
  * D3D9SW_GHPIN puts the private heap at an address we choose instead of one
@@ -2276,8 +5736,12 @@ static unsigned gh_knob(const char *name, unsigned def)
 
 static HANDLE gh_create_heap(void)
 {
-	unsigned want = gh_knob("D3D9SW_GHPIN", 0);
-	unsigned mb = gh_knob("D3D9SW_GHPIN_MB", 64);
+	/* Import mode pins by default: a heap at a caller-chosen base never turns
+	 * on the low-fragmentation front end (measured: still mode 0 after 20000
+	 * same-size blocks, where a HeapCreate heap switches to 2), so all of its
+	 * bookkeeping stays inside the region a restore copies. */
+	unsigned want = gh_knob("D3D9SW_GHPIN", g_imports ? 1 : 0);
+	unsigned mb = gh_knob("D3D9SW_GHPIN_MB", g_imports ? 256 : 64);
 	uintptr_t base;
 	SIZE_T size;
 	void *res;
@@ -2332,6 +5796,23 @@ static HANDLE gh_create_heap(void)
 		       "OS-placed at %08lX instead - bounded and wholesale-able, just not "
 		       "at the fixed base (determinism traces will not compare)\n",
 		       mb, (unsigned long)base, err, (unsigned long)(uintptr_t)res);
+	}
+	if (g_imports && gh_knob("D3D9SW_GHOWN", 1)) {
+		if (!gho_init(res, size)) {
+			ss_log("gameheap: cannot commit the first page at %p (error %lu) - "
+			       "falling back to HeapCreate\n",
+			       res, GetLastError());
+			VirtualFree(res, 0, MEM_RELEASE);
+			return HeapCreate(0, 1u << 20, 0);
+		}
+		ss_log("gameheap: heap PINNED at %p, %u MB, served by our own allocator - "
+		       "no Windows heap state inside the span (D3D9SW_GHOWN=0 for "
+		       "RtlCreateHeap)\n",
+		       res, mb);
+		g_pin_mb = mb;
+		g_heap_lo = (uintptr_t)res;
+		g_heap_hi = (uintptr_t)res + size;
+		return (HANDLE)res;
 	}
 	h = (HANDLE)p_RtlCreateHeap(0, res, size, 1u << 20, NULL, NULL);
 	if (!h) {
@@ -2472,6 +5953,30 @@ int gameheap_anchor_ranges(uintptr_t *base, uintptr_t *size, int max)
 		base[n] = g_laa_lo;
 		size[n] = g_laa_hi - g_laa_lo;
 		n++;
+	}
+	return n;
+}
+
+/* Every span we pinned at a fixed address: the heap, the game's own
+ * reservations and the big-block chunks. For labelling only. */
+int gameheap_pin_ranges(uintptr_t *base, uintptr_t *size, const char **what, int max)
+{
+	int n = 0;
+
+	if (g_heap_lo && g_heap_hi && n < max) {
+		base[n] = g_heap_lo;
+		size[n] = g_heap_hi - g_heap_lo;
+		what[n++] = "gameheap pin: heap";
+	}
+	if (g_raw_base && g_raw_n && n < max) {
+		base[n] = g_raw_base;
+		size[n] = (uintptr_t)g_raw_n * GH_RAW_GRAN;
+		what[n++] = "gameheap pin: game reservations";
+	}
+	if (g_bigpin_base && g_bigpin_size && n < max) {
+		base[n] = g_bigpin_base;
+		size[n] = g_bigpin_size;
+		what[n++] = "gameheap pin: big blocks";
 	}
 	return n;
 }
@@ -3084,7 +6589,73 @@ int gameheap_whatis(const void *p, unsigned *site, unsigned *size, unsigned *ord
 
 void gameheap_report(void)
 {
+	gh_early_flush();
 	gh_trace_dump();
+	if (g_vaj && !g_vaj_held) {
+		/* Not at attach: excluding starts the engine's helper thread, which
+		 * must not happen under the loader lock. */
+		savestate_exclude(g_vaj, sizeof(GhVaJ));
+		g_vaj_held = 1;
+	}
+	if (g_res && !g_res_held) {
+		savestate_exclude(g_res, sizeof(GhRes));
+		g_res_held = 1;
+	}
+	if (g_al_real && !g_al_held) {
+		savestate_exclude(g_al_real, sizeof(AlReal));
+		g_al_held = 1;
+	}
+	if (g_di && !g_di_held) {
+		savestate_exclude(g_di, sizeof(GhDiHome));
+		g_di_held = 1;
+	}
+	if (g_pxt && !g_pxt_held) {
+		savestate_exclude(g_pxt, sizeof(PxTrace));
+		savestate_exclude(g_pxt_code, PXT_MAX * PXT_STUB);
+#if defined(__i386__) || defined(_M_IX86)
+		if (g_pxj)
+			savestate_exclude(g_pxj, PXJ_MAX * sizeof(PxjRec));
+#endif
+		g_pxt_held = 1;
+	}
+	pxj_dump();
+	ss_log("physx: %s; %ld step(s) run, %ld skipped\n", g_px_status, (long)g_px_steps,
+	       (long)g_px_skipped);
+	if (g_pxt)
+		ss_log("physx trace: %ld method(s) in %ld table(s) watched, tick %ld\n",
+		       (long)g_pxt->ns, (long)g_pxt->nvt, (long)g_pxt->tick);
+	if (g_ready && g_imports) {
+		size_t live = 0, peak = 0, com = 0;
+		unsigned long nb = 0, fails = 0;
+		LONG i;
+
+		for (i = 0; i < g_nbig; i++) {
+			live += g_bigch[i]->live;
+			peak += g_bigch[i]->peak;
+			com += g_bigch[i]->committed;
+			nb += g_bigch[i]->nalloc;
+			fails += g_bigch[i]->nfail;
+		}
+		ss_log("gameheap: import mode - %lu module(s), %lu slot(s); %lu allocation(s) "
+		       "served, %lu freed to us, %lu passed back to the runtime, %lu "
+		       "runtime block(s) migrated on realloc, %lu caught at ucrtbase's "
+		       "floor\n",
+		       g_mods_patched, g_slots_patched, g_alloc, g_freed_ours,
+		       g_freed_theirs, g_migrated, g_caught);
+		ss_log("gameheap: import mode - big blocks: %ld chunk(s), %lu served, %lu KB "
+		       "live, %lu KB peak, %lu KB committed; %lu commit failure(s), %lu "
+		       "chunk(s) refused, %lu bad header(s)%s\n",
+		       (long)g_nbig, nb, (unsigned long)(live >> 10),
+		       (unsigned long)(peak >> 10), (unsigned long)(com >> 10), fails,
+		       g_big_nochunk, g_big_bad,
+		       (fails || g_big_nochunk || g_big_bad) ? " <<< read this" : "");
+		if (g_fellback || g_orphan_dropped || g_stale || g_mods_unbound)
+			ss_log("gameheap: import mode - %lu fell back to the runtime (heap "
+			       "full: raise D3D9SW_GHPIN_MB), %lu orphan(s) dropped, %lu "
+			       "headerless pointer(s), %lu module(s) seen unbound\n",
+			       g_fellback, g_orphan_dropped, g_stale, g_mods_unbound);
+		return;
+	}
 	if (!g_ready) {
 		if (on())
 			ss_log("gameheap: asked for, but not installed\n");

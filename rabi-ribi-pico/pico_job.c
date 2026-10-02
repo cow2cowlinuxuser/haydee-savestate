@@ -410,6 +410,89 @@ static int is_alive(HANDLE h)
 	return h && WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
 }
 
+/* Bring the caged game's window to the front.
+ *
+ * Steam starts the game while something else owns the foreground, and Windows
+ * will not hand a window focus it did not ask for. A fullscreen game that
+ * minimizes itself whenever it is deactivated - Haydee does - then starts
+ * minimized and stays there. Joining the foreground window's input queue for a
+ * moment is the standard way past that lock. */
+typedef struct {
+	const DWORD *pid;
+	int npid;
+	HWND best;
+	LONG best_area;
+} FindWin;
+
+static BOOL CALLBACK find_win_one(HWND h, LPARAM lp)
+{
+	FindWin *f = (FindWin *)lp;
+	DWORD pid = 0;
+	RECT rc;
+	LONG area;
+	int i;
+
+	if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER))
+		return TRUE;
+	GetWindowThreadProcessId(h, &pid);
+	for (i = 0; i < f->npid && f->pid[i] != pid; i++)
+		;
+	if (i == f->npid)
+		return TRUE;
+	/* A minimized window reports a tiny rect; count it as the game anyway. */
+	area = 1;
+	if (!IsIconic(h) && GetWindowRect(h, &rc))
+		area = (rc.right - rc.left) * (rc.bottom - rc.top);
+	if (!f->best || area > f->best_area) {
+		f->best = h;
+		f->best_area = area;
+	}
+	return TRUE;
+}
+
+static void bring_to_front(const DWORD *pid, const HANDLE *ph, int n)
+{
+	DWORD live[MAX_SEEN];
+	DWORD t0 = GetTickCount();
+	FindWin f;
+	int i, nlive = 0;
+
+	for (i = 0; i < n; i++)
+		if (is_alive(ph[i]))
+			live[nlive++] = pid[i];
+	if (!nlive)
+		return;
+	memset(&f, 0, sizeof(f));
+	f.pid = live;
+	f.npid = nlive;
+	while (!f.best && GetTickCount() - t0 < 30000) {
+		EnumWindows(find_win_one, (LPARAM)&f);
+		if (!f.best)
+			Sleep(250);
+	}
+	if (!f.best) {
+		printf("no visible game window within 30s; left the foreground alone.\n");
+		return;
+	}
+	{
+		HWND fg = GetForegroundWindow();
+		DWORD fg_tid = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+		DWORD me = GetCurrentThreadId();
+		int attached = fg_tid && fg_tid != me && AttachThreadInput(me, fg_tid, TRUE);
+
+		if (IsIconic(f.best))
+			ShowWindow(f.best, SW_RESTORE);
+		BringWindowToTop(f.best);
+		SetForegroundWindow(f.best);
+		if (attached)
+			AttachThreadInput(me, fg_tid, FALSE);
+	}
+	Sleep(200);
+	printf("game window %p %s\n", (void *)f.best,
+	       GetForegroundWindow() == f.best ? "brought to the front"
+					       : "could NOT take the foreground - click it to restore");
+}
+
 static int adopt(const wchar_t *appid, const wchar_t *exe)
 {
 	HANDLE job;
@@ -486,6 +569,7 @@ static int adopt(const wchar_t *appid, const wchar_t *exe)
 			printf("a caged %ls has been alive >4s; it is the game, not the "
 			       "stub. Holding the cage.\n",
 			       exe);
+			bring_to_front(ad_pid, ad_h, nad);
 			break;
 		}
 		if (GetTickCount() - start > 45000) {

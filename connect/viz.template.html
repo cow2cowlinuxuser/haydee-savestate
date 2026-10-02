@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Savestate connections</title>
+<style>
+  :root {
+    --bg: #12141a;
+    --bg2: #1a1d24;
+    --bg3: #22262f;
+    --ink: #d7dde8;
+    --muted: #8b93a3;
+    --line: #2c3340;
+    --accent: #c8a35a;
+    --hazard: #d4655a;
+    --ok: #6aae8b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 13px/1.4 "Segoe UI", system-ui, sans-serif; }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--bg2);
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: 0.02em; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  select, button, input[type="search"] {
+    background: var(--bg3); color: var(--ink); border: 1px solid var(--line);
+    padding: 5px 8px; border-radius: 3px;
+  }
+  button { cursor: pointer; }
+  button.active { border-color: var(--accent); color: var(--accent); }
+  label.check { color: var(--muted); display: inline-flex; gap: 5px; align-items: center; }
+  main { display: grid; grid-template-columns: 220px 1fr 300px; grid-template-rows: 1fr 190px; height: calc(100% - 58px); }
+  #rail, #inspect, #dist { background: var(--bg2); border-right: 1px solid var(--line); overflow: auto; }
+  #inspect { border-right: none; border-left: 1px solid var(--line); }
+  #dist { grid-column: 1 / -1; border-top: 1px solid var(--line); border-right: none; padding: 10px 16px; }
+  #rail { padding: 12px; }
+  #rail h2, #inspect h2, #dist h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 8px; }
+  #stage { position: relative; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+  .legend { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
+  .swatch { display: flex; align-items: center; gap: 8px; color: var(--ink); }
+  .swatch i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  #filters { display: flex; flex-direction: column; gap: 5px; }
+  #inspect { padding: 12px; }
+  #inspect .ev { font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; color: #c5cdd8; background: var(--bg); padding: 8px; margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
+  #inspect .meta { color: var(--muted); margin: 4px 0; }
+  #inspect .hazard { color: var(--hazard); }
+  #inspect .ok { color: var(--ok); }
+  #bars { display: flex; gap: 24px; }
+  .barcol { flex: 1; min-width: 0; }
+  .bar { display: grid; grid-template-columns: 140px 1fr 48px; gap: 8px; align-items: center; margin: 3px 0; font-size: 12px; }
+  .bar .track { height: 7px; background: var(--bg3); }
+  .bar .fill { height: 7px; background: var(--accent); }
+  .bar.hz .fill { background: var(--hazard); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  td, th { text-align: left; padding: 3px 8px 3px 0; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  .hint { position: absolute; left: 12px; bottom: 10px; color: var(--muted); font-size: 11px; pointer-events: none; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Savestate connections</h1>
+    <div class="sub" id="status">logged edges only — no inferred links</div>
+  </div>
+  <div class="row">
+    <button id="btnDate" class="active">By date</button>
+    <button id="btnTime">Over time</button>
+    <select id="session"></select>
+    <input type="search" id="q" placeholder="filter name / address" />
+  </div>
+</header>
+<main>
+  <aside id="rail">
+    <h2>Show</h2>
+    <div id="filters"></div>
+    <h2 style="margin-top:16px">Kinds</h2>
+    <div class="legend" id="legend"></div>
+  </aside>
+  <section id="stage">
+    <canvas id="cv"></canvas>
+    <div class="hint">drag nodes · scroll to zoom · click a node or edge for the log line that created it</div>
+  </section>
+  <aside id="inspect">
+    <h2>Evidence</h2>
+    <div id="detail">Pick a session, then a node or link.</div>
+  </aside>
+  <section id="dist">
+    <h2>Distribution of logged connections</h2>
+    <div id="bars"></div>
+  </section>
+</main>
+<script>
+window.CONNECT_DATA = __CONNECT_DATA__;
+</script>
+<script>
+(function () {
+  const DATA = window.CONNECT_DATA || { sessions: [] };
+  const KINDS = [
+    { id: "thread", label: "thread", color: "#7aa2f7" },
+    { id: "heap", label: "heap", color: "#c8a35a" },
+    { id: "module", label: "module", color: "#6aae8b" },
+    { id: "region", label: "region / private", color: "#9b8ec4" },
+    { id: "pointer", label: "pointer class", color: "#d4a27f" },
+    { id: "name", label: "named site", color: "#c5cdd8" }
+  ];
+  const EDGE_SHOW = [
+    { id: "owns", label: "heap owned by name" },
+    { id: "parked", label: "thread parked in module" },
+    { id: "holds", label: "thread holds pointer into heap" },
+    { id: "belong", label: "system thread belongs to" },
+    { id: "from", label: "heap created from" },
+    { id: "import", label: "rewound import into present" },
+    { id: "points", label: "pointer class / private landing" },
+    { id: "ptrmod", label: "pointer hits into held modules" },
+    { id: "clash", label: "heap / present clash" },
+    { id: "lfh", label: "LFH bookkeeping for heap" },
+    { id: "fault", label: "fault / register" },
+    { id: "witness", label: "player / carry" },
+    { id: "dsound", label: "DirectSound names" },
+    { id: "reach", label: "reachability contest" },
+    { id: "setting", label: "setting bound to target" }
+  ];
+  const colorOf = Object.fromEntries(KINDS.map(k => [k.id, k.color]));
+  const shown = Object.fromEntries(EDGE_SHOW.map(e => [e.id, e.id !== "ptrmod"]));
+  const HAZARD_EDGES = new Set(["holds", "clash", "fault", "points"]);
+
+  const $ = id => document.getElementById(id);
+  const sessSel = $("session");
+  const cv = $("cv");
+  const ctx = cv.getContext("2d");
+  let mode = "date";
+  let selected = null;
+  let hover = null;
+  let graph = { nodes: [], edges: [] };
+  let sim = [];
+  let view = { x: 0, y: 0, k: 1 };
+  let drag = null;
+  let persistMax = 1;
+
+  const sessions = (DATA.sessions || []).slice().sort((a, b) => String(a.when).localeCompare(String(b.when)));
+  function arr(x) { return Array.isArray(x) ? x : (x ? [x] : []); }
+
+  function fillLegend() {
+    $("legend").innerHTML = KINDS.map(k =>
+      `<div class="swatch"><i style="background:${k.color}"></i>${k.label}</div>`
+    ).join("");
+    $("filters").innerHTML = EDGE_SHOW.map(e =>
+      `<label class="check"><input type="checkbox" data-e="${e.id}" ${e.id === "ptrmod" ? "" : "checked"}> ${e.label}</label>`
+    ).join("");
+    $("filters").addEventListener("change", ev => {
+      const t = ev.target;
+      if (t && t.dataset.e) { shown[t.dataset.e] = t.checked; rebuild(); }
+    });
+  }
+
+  function fillSessions() {
+    sessSel.innerHTML = sessions.map((s, i) => {
+      const tag = s.tag && s.tag !== "live" ? ` · ${s.tag}` : "";
+      const out = s.outcome ? ` · ${s.outcome}` : "";
+      return `<option value="${i}">${s.when}  pid ${s.pid}${tag}${out}</option>`;
+    }).join("");
+    if (sessions.length) sessSel.value = String(sessions.length - 1);
+  }
+
+  function stableNode(n) {
+    if (n.kind === "heap") return "heap:" + (n.owner || n.label);
+    if (n.kind === "thread") {
+      if (n.park) return "park:" + n.park;
+      if (n.belong) return "sys:" + n.belong;
+      return "thread:" + (n.role || n.label);
+    }
+    if (n.kind === "module") return "module:" + (n.name || n.label);
+    if (n.kind === "region") return "region:" + (n.role || n.label);
+    if (n.kind === "pointer") return "ptr:" + n.label;
+    if (n.kind === "name") return "name:" + n.label;
+    return n.kind + ":" + n.label;
+  }
+
+  function mergeOverTime(list) {
+    const nmap = new Map();
+    const emap = new Map();
+    for (const s of list) {
+      const idMap = {};
+      for (const n of arr(s.nodes)) {
+        const sid = stableNode(n);
+        idMap[n.id] = sid;
+        let m = nmap.get(sid);
+        if (!m) {
+          m = Object.assign({}, n, { id: sid, count: 0, sessions: [] });
+          nmap.set(sid, m);
+        }
+        m.count += 1;
+        m.sessions.push(s.id);
+        if (n.votes > (m.votes || 0)) m.votes = n.votes;
+        if (n.hits > (m.hits || 0)) m.hits = n.hits;
+      }
+      for (const e of arr(s.edges)) {
+        const a = idMap[e.from], b = idMap[e.to];
+        if (!a || !b || a === b) continue;
+        const k = a + "|" + e.kind + "|" + b;
+        let m = emap.get(k);
+        if (!m) {
+          m = { from: a, to: b, kind: e.kind, weight: 0, hazard: !!e.hazard, evidence: [], sessions: [] };
+          emap.set(k, m);
+        }
+        m.weight += e.weight || 1;
+        m.sessions.push(s.id);
+        if (e.evidence && m.evidence.length < 3) m.evidence.push("[" + s.when + "] " + e.evidence[0]);
+      }
+    }
+    persistMax = Math.max(1, list.length);
+    return { nodes: [...nmap.values()], edges: [...emap.values()] };
+  }
+
+  function currentSessions() {
+    if (!sessions.length) return [];
+    if (mode === "date") {
+      const i = parseInt(sessSel.value, 10);
+      return [sessions[i] || sessions[sessions.length - 1]];
+    }
+    return sessions;
+  }
+
+  function collapseParked(g) {
+    const remap = {};
+    const parked = {};
+    const nodes = [];
+    for (const n of g.nodes) {
+      if (n.kind === "thread" && n.park && n.role === "parked") {
+        const sid = "park:" + n.park;
+        remap[n.id] = sid;
+        if (!parked[sid]) {
+          parked[sid] = { id: sid, kind: "thread", label: n.park, park: n.park, count: 0 };
+          nodes.push(parked[sid]);
+        }
+        parked[sid].count += 1;
+        parked[sid].label = parked[sid].count + " @ " + n.park;
+      } else {
+        nodes.push(n);
+        remap[n.id] = n.id;
+      }
+    }
+    const edges = [];
+    const seen = {};
+    for (const e of g.edges) {
+      const a = remap[e.from] || e.from, b = remap[e.to] || e.to;
+      if (!a || !b || a === b) continue;
+      const k = a + "|" + e.kind + "|" + b;
+      if (seen[k]) { seen[k].weight += e.weight || 1; continue; }
+      const ne = Object.assign({}, e, { from: a, to: b });
+      seen[k] = ne;
+      edges.push(ne);
+    }
+    return { nodes, edges };
+  }
+
+  function visibleGraph(src) {
+    const q = ($("q").value || "").trim().toLowerCase();
+    const edges = arr(src.edges).filter(e => shown[e.kind] !== false);
+    const used = new Set();
+    edges.forEach(e => { used.add(e.from); used.add(e.to); });
+    let nodes = arr(src.nodes).filter(n => used.has(n.id));
+    let g = { nodes, edges };
+    if (mode === "date") g = collapseParked(g);
+    if (q) {
+      nodes = g.nodes.filter(n =>
+        (n.label || "").toLowerCase().includes(q) ||
+        (n.owner || "").toLowerCase().includes(q) ||
+        (n.id || "").toLowerCase().includes(q) ||
+        (n.park || "").toLowerCase().includes(q)
+      );
+      const keep = new Set(nodes.map(n => n.id));
+      return { nodes, edges: g.edges.filter(e => keep.has(e.from) && keep.has(e.to)) };
+    }
+    return g;
+  }
+
+  function layout(g) {
+    const W = cv.width, H = cv.height;
+    const cx = W / 2, cy = H / 2;
+    sim = g.nodes.map((n, i) => {
+      const ang = (i / Math.max(1, g.nodes.length)) * Math.PI * 2;
+      return {
+        n,
+        x: cx + Math.cos(ang) * 120,
+        y: cy + Math.sin(ang) * 90,
+        vx: 0, vy: 0
+      };
+    });
+    const idx = Object.fromEntries(sim.map(s => [s.n.id, s]));
+    const links = g.edges.map(e => ({ e, a: idx[e.from], b: idx[e.to] })).filter(l => l.a && l.b);
+    for (let t = 0; t < 180; t++) {
+      for (let i = 0; i < sim.length; i++) {
+        for (let j = i + 1; j < sim.length; j++) {
+          let dx = sim[j].x - sim[i].x, dy = sim[j].y - sim[i].y;
+          let d2 = dx * dx + dy * dy || 0.01;
+          let f = 1400 / d2;
+          let d = Math.sqrt(d2);
+          sim[i].vx -= f * dx / d; sim[i].vy -= f * dy / d;
+          sim[j].vx += f * dx / d; sim[j].vy += f * dy / d;
+        }
+      }
+      for (const l of links) {
+        let dx = l.b.x - l.a.x, dy = l.b.y - l.a.y;
+        let d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+        let rest = 90;
+        let f = (d - rest) * 0.02;
+        l.a.vx += f * dx / d; l.a.vy += f * dy / d;
+        l.b.vx -= f * dx / d; l.b.vy -= f * dy / d;
+      }
+      for (const s of sim) {
+        s.vx += (cx - s.x) * 0.004;
+        s.vy += (cy - s.y) * 0.004;
+        s.vx *= 0.82; s.vy *= 0.82;
+        s.x += s.vx; s.y += s.vy;
+      }
+    }
+    graph = g;
+    graph._idx = idx;
+    graph._links = links;
+  }
+
+  function nodeRadius(n) {
+    const base = n.kind === "heap" ? 8 : n.kind === "module" ? 6 : 5;
+    const extra = Math.min(10, Math.log10((n.hits || n.votes || n.count || 1) + 1) * 4);
+    return base + extra;
+  }
+
+  function toWorld(mx, my) {
+    return { x: (mx - view.x) / view.k, y: (my - view.y) / view.k };
+  }
+
+  function hit(mx, my) {
+    const p = toWorld(mx, my);
+    for (let i = sim.length - 1; i >= 0; i--) {
+      const s = sim[i];
+      const r = nodeRadius(s.n) + 3;
+      if ((p.x - s.x) ** 2 + (p.y - s.y) ** 2 <= r * r) return { type: "node", s };
+    }
+    for (const l of graph._links || []) {
+      const d = distToSeg(p.x, p.y, l.a.x, l.a.y, l.b.x, l.b.y);
+      if (d < 5 / view.k) return { type: "edge", l };
+    }
+    return null;
+  }
+
+  function distToSeg(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const l2 = dx * dx + dy * dy || 1;
+    let t = ((px - x1) * dx + (py - y1) * dy) / l2;
+    t = Math.max(0, Math.min(1, t));
+    const x = x1 + t * dx, y = y1 + t * dy;
+    return Math.hypot(px - x, py - y);
+  }
+
+  function draw() {
+    const dpr = window.devicePixelRatio || 1;
+    const r = cv.getBoundingClientRect();
+    if (cv.width !== r.width * dpr || cv.height !== r.height * dpr) {
+      cv.width = r.width * dpr;
+      cv.height = r.height * dpr;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, r.width, r.height);
+    ctx.save();
+    ctx.translate(view.x, view.y);
+    ctx.scale(view.k, view.k);
+    for (const l of graph._links || []) {
+      const haz = l.e.hazard || HAZARD_EDGES.has(l.e.kind);
+      const persist = (l.e.sessions && l.e.sessions.length) ? l.e.sessions.length / persistMax : 1;
+      ctx.beginPath();
+      ctx.moveTo(l.a.x, l.a.y);
+      ctx.lineTo(l.b.x, l.b.y);
+      ctx.strokeStyle = haz ? "rgba(212,101,90," + (0.25 + persist * 0.55) + ")" : "rgba(200,163,90," + (0.18 + persist * 0.5) + ")";
+      ctx.lineWidth = (selected && selected.l === l ? 2.4 : 1) / view.k;
+      ctx.stroke();
+    }
+    for (const s of sim) {
+      const n = s.n;
+      const rad = nodeRadius(n);
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, rad, 0, Math.PI * 2);
+      ctx.fillStyle = colorOf[n.kind] || "#c5cdd8";
+      ctx.fill();
+      if (selected && selected.s === s) {
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 2 / view.k;
+        ctx.stroke();
+      }
+      ctx.fillStyle = "#d7dde8";
+      ctx.font = (10 / view.k) + "px Segoe UI";
+      ctx.fillText(n.label, s.x + rad + 3, s.y + 3);
+    }
+    ctx.restore();
+  }
+
+  function evidenceHtml(title, rows, extra) {
+    let h = `<div><strong>${esc(title)}</strong></div>`;
+    if (extra) h += extra;
+    for (const line of rows || []) h += `<div class="ev">${esc(line)}</div>`;
+    if (!rows || !rows.length) h += `<div class="meta">No quoted line stored for this link.</div>`;
+    $("detail").innerHTML = h;
+  }
+
+  function esc(s) {
+    return String(s ?? "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  }
+
+  function inspect(h) {
+    selected = h;
+    if (!h) { $("detail").innerHTML = "Pick a session, then a node or link."; draw(); return; }
+    if (h.type === "node") {
+      const n = h.s.n;
+      const bits = [
+        `<div class="meta">kind ${esc(n.kind)}${n.owner ? " · owner " + esc(n.owner) : ""}${n.policy ? " · " + esc(n.policy) : ""}</div>`,
+        n.park ? `<div class="meta">park ${esc(n.park)}</div>` : "",
+        n.votes != null ? `<div class="meta">votes ${n.votes}</div>` : "",
+        n.hits != null ? `<div class="meta">pointer hits ${n.hits}</div>` : "",
+        n.count ? `<div class="meta">seen in ${n.count} session(s)</div>` : ""
+      ].join("");
+      const ev = [];
+      for (const l of graph._links || []) {
+        if (l.a === h.s || l.b === h.s) {
+          (l.e.evidence || []).slice(0, 2).forEach(x => ev.push(l.e.kind + " — " + x));
+        }
+      }
+      evidenceHtml(n.label, ev, bits);
+    } else {
+      const e = h.l.e;
+      const persist = e.sessions ? e.sessions.length + " / " + persistMax + " sessions" : "";
+      const extra = `<div class="meta${e.hazard ? " hazard" : ""}">${esc(e.kind)} · weight ${e.weight || 1} ${persist}</div>
+        <div class="meta">${esc(h.l.a.n.label)} → ${esc(h.l.b.n.label)}</div>`;
+      evidenceHtml(e.kind, e.evidence, extra);
+    }
+    draw();
+  }
+
+  function barsFor(g, list) {
+    const kinds = {};
+    for (const e of g.edges || []) {
+      kinds[e.kind] = (kinds[e.kind] || 0) + (e.weight || 1);
+    }
+    const max = Math.max(1, ...Object.values(kinds));
+    const kindBars = Object.entries(kinds).sort((a, b) => b[1] - a[1]).map(([k, v]) => {
+      const hz = HAZARD_EDGES.has(k) ? " hz" : "";
+      return `<div class="bar${hz}"><span>${esc(k)}</span><div class="track"><div class="fill" style="width:${(100 * v / max).toFixed(1)}%"></div></div><span>${v}</span></div>`;
+    }).join("");
+
+    let persist = "";
+    if (mode === "time") {
+      const ranked = (g.edges || []).slice().sort((a, b) => (b.sessions?.length || 0) - (a.sessions?.length || 0)).slice(0, 12);
+      persist = `<table><tr><th>Named pair</th><th>Sessions</th></tr>${ranked.map(e => {
+        const a = g.nodes.find(n => n.id === e.from);
+        const b = g.nodes.find(n => n.id === e.to);
+        return `<tr><td>${esc(a?.label)} → ${esc(b?.label)}</td><td>${e.sessions?.length || 0}</td></tr>`;
+      }).join("")}</table>`;
+    } else {
+      const s = list[0];
+      persist = s ? `<div class="meta">${esc(s.when)} pid ${s.pid} · ${esc(s.outcome || "")} · ${esc(s.file)}</div>
+        <div class="meta">${esc(s.policy || "")}</div>
+        <div class="meta">threads ${s.stats?.threads ?? "?"} · heaps ${s.stats?.heaps ?? "?"} · present ${s.stats?.presentPct ?? "?"}%</div>` : "";
+    }
+    $("bars").innerHTML = `<div class="barcol"><h2>Edge weight by kind</h2>${kindBars || "<div class='meta'>nothing matched the filters</div>"}</div>
+      <div class="barcol"><h2>${mode === "time" ? "Most persistent named pairs" : "This session"}</h2>${persist}</div>`;
+  }
+
+  function rebuild() {
+    const list = currentSessions();
+    const src = mode === "time" ? mergeOverTime(list) : (list[0] || { nodes: [], edges: [] });
+    const vis = visibleGraph(src);
+    const r = cv.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    cv.width = r.width * dpr;
+    cv.height = r.height * dpr;
+    layout(vis);
+    view = { x: 0, y: 0, k: 1 };
+    selected = null;
+    const nSess = list.length;
+    $("status").textContent = mode === "time"
+      ? `${nSess} session(s), names collapsed across addresses — ${vis.nodes.length} named nodes, ${vis.edges.length} logged links`
+      : (list[0] ? `${list[0].when} pid ${list[0].pid} — ${vis.nodes.length} nodes, ${vis.edges.length} logged links` : "no sessions");
+    barsFor(vis, list);
+    inspect(null);
+    draw();
+  }
+
+  function pointerPos(ev) {
+    const r = cv.getBoundingClientRect();
+    return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  }
+
+  cv.addEventListener("mousedown", ev => {
+    const p = pointerPos(ev);
+    const h = hit(p.x, p.y);
+    if (h && h.type === "node") {
+      drag = { s: h.s, ox: p.x, oy: p.y };
+    } else {
+      drag = { pan: true, ox: p.x - view.x, oy: p.y - view.y };
+    }
+  });
+  window.addEventListener("mousemove", ev => {
+    const p = pointerPos(ev);
+    if (drag && drag.s) {
+      const w = toWorld(p.x, p.y);
+      drag.s.x = w.x; drag.s.y = w.y;
+      draw();
+    } else if (drag && drag.pan) {
+      view.x = p.x - drag.ox; view.y = p.y - drag.oy;
+      draw();
+    } else {
+      hover = hit(p.x, p.y);
+    }
+  });
+  window.addEventListener("mouseup", ev => {
+    const p = pointerPos(ev);
+    if (drag && !drag.pan) inspect(hit(p.x, p.y));
+    else if (drag && drag.pan) { /* pan */ }
+    else inspect(hit(p.x, p.y));
+    drag = null;
+  });
+  cv.addEventListener("wheel", ev => {
+    ev.preventDefault();
+    const p = pointerPos(ev);
+    const old = view.k;
+    view.k = Math.max(0.3, Math.min(4, view.k * (ev.deltaY < 0 ? 1.1 : 0.9)));
+    view.x = p.x - (p.x - view.x) * view.k / old;
+    view.y = p.y - (p.y - view.y) * view.k / old;
+    draw();
+  }, { passive: false });
+
+  $("btnDate").onclick = () => { mode = "date"; $("btnDate").classList.add("active"); $("btnTime").classList.remove("active"); sessSel.disabled = false; rebuild(); };
+  $("btnTime").onclick = () => { mode = "time"; $("btnTime").classList.add("active"); $("btnDate").classList.remove("active"); sessSel.disabled = true; rebuild(); };
+  sessSel.onchange = rebuild;
+  $("q").addEventListener("input", rebuild);
+  window.addEventListener("resize", rebuild);
+
+  fillLegend();
+  fillSessions();
+  if (DATA.defaultMode === "time") $("btnTime").click();
+  else rebuild();
+})();
+</script>
+</body>
+</html>

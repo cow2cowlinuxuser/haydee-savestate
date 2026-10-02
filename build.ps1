@@ -32,6 +32,15 @@ Write-Host "built ss_harness.exe (savestate engine, no game)"
 & $zig cc @warn -target x86-windows-gnu -o port_harness32.exe port_harness.c savestate.c dsoundhook.c ds_sw.c xa2_sw.c gameheap.c -luser32 -lwinmm
 if ($LASTEXITCODE -eq 0) { "built port_harness32.exe (engine port sitting, no game)" }
 
+# One DLL loaded from two folders under one name, the way our d3d11/dxgi sit
+# beside the system's, then a same-process restore with RELOC on: any shift or
+# tripwire means module identity confused the two copies again.
+& $zig cc @warn -target x86-windows-gnu -shared -o reloc_dup.dll reloc_dup.c
+if ($LASTEXITCODE -eq 0) {
+	& $zig cc @warn -target x86-windows-gnu -o reloc_harness32.exe reloc_harness.c savestate.c dsoundhook.c ds_sw.c xa2_sw.c gameheap.c -luser32 -lwinmm
+	if ($LASTEXITCODE -eq 0) { "built reloc_harness32.exe (duplicate-name module identity, no game)" }
+}
+
 # A DirectSound streaming loop with no game attached, to find out whether the
 # negative-length copy is a property of the arrangement or of how this game
 # uses it. 32-bit to match the title.
@@ -96,6 +105,66 @@ Write-Host "built ss_harness32.exe (savestate engine, PE32)"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Write-Host "built test_seam.exe (absolute coverage and sampling audit)"
 
+# pixbench.exe - the per-pixel colour kernels (pack/unpack, B5G6R5 and BC1
+# decode, red/blue swizzle, saturating add/subtract, source-over mix, modulate,
+# and the YCbCr baseband transform) lifted out of d3d11_sw.c/swrast.c as scalar,
+# AVX2 and AVX512 forms, each vector path checked bit-exact against scalar and
+# then timed per 720p frame. No global -mavx flags on purpose: the baseline must
+# be generic codegen so the scalar column is honest (the stock DLL ships without
+# -march=haswell), and only the target-attributed kernels get AVX. The 512-bit
+# encodings still need to exist in the object, which the per-function evex512
+# attribute provides. -ffp-contract=off keeps the float pack path from being
+# contracted into an FMA that would round differently than the scalar reference.
+& $zig cc @warn -ffp-contract=off -target x86_64-windows-gnu -o pixbench.exe pixbench.c
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host "built pixbench.exe (pixel kernels scalar/AVX2/AVX512, per 720p frame)"
+
+# pixbench_gpu.exe - the same colour math on a real GPU via a compute shader, to
+# measure whether offloading it beats the CPU once the PCIe round-trip is paid.
+# Resolves system d3d11/d3dcompiler at runtime (no import libs), so it links on a
+# machine with neither and reports them absent. Run it from a folder WITHOUT this
+# repo's software d3d11.dll/dxgi.dll beside it, or the loader shadows the real ones.
+& $zig cc @warn -target x86_64-windows-gnu -o pixbench_gpu.exe pixbench_gpu.c
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host "built pixbench_gpu.exe (GPU compute offload vs CPU, per 720p frame)"
+
+# pixtune.exe - does hand tuning move the straight AVX512 kernels: non-temporal
+# stores, multiple accumulators, and decode/modulate/blend fusion, each checked
+# bit-exact against its baseline. Same -ffp-contract=off baseline as pixbench.
+& $zig cc @warn -ffp-contract=off -target x86_64-windows-gnu -o pixtune.exe pixtune.c
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host "built pixtune.exe (hand-tuning levers vs AVX512 baseline, per 720p frame)"
+
+# fpsharness.exe - a standalone window that asks what a stable 240 / 480 fps
+# needs and shows the ways a 60 Hz world can be presented at those rates without
+# the windmill effect. It attaches to nothing. It links no d3d11/dxgi by name and
+# loads System32's copies by absolute path at runtime, on purpose: this repo's
+# own software d3d11.dll/dxgi.dll sit beside the .exe, and a name import would let
+# the wrapper inject itself into the harness (it faults in its own Swap_Present,
+# since its patches are meant for rabiribi.exe). Scripted runs:
+#   fpsharness.exe <targetfps> <vsync0|1> <seconds>   e.g. "480 0 5"
+& $zig cc @warn -target x86_64-windows-gnu -o fpsharness.exe fpsharness.c `
+	-ldxguid -luser32 -lwinmm "-Wl,--subsystem,windows"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host "built fpsharness.exe (fps pacing + logic/render decoupling demo, no game)"
+
+# gpuark.exe - tests whether GPU-PRODUCED state (a rendertarget the GPU wrote and
+# later frames read) can be reconstructed bit-exact from a CPU-side shadow taken
+# at an idle boundary, after the D3D11 device and every object are destroyed. The
+# question that decides whether the gpuhost/boundary-interposition approach can be
+# pointed at an emulator's GPU. Same System32 absolute-path load as fpsharness so
+# the repo's software d3d11.dll cannot shadow the real one. -DTEX=2048 for a
+# realistic readback-bandwidth figure (the default 256 is latency-bound).
+& $zig cc @warn -target x86_64-windows-gnu -o gpuark.exe gpuark.c -ldxguid -luser32
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host "built gpuark.exe (GPU-state reconstruct-from-CPU-shadow test, no game)"
+
+# glsl_harness.exe - validates the software GLSL interpreter (glsl.c) against
+# Haydee's real vertex/fragment shaders offline, before it is wired into gl_sw.c.
+& $zig cc @warn -target x86_64-windows-gnu -o glsl_harness.exe glsl_harness.c glsl.c -lm
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host "built glsl_harness.exe (GLSL interpreter validation, no game)"
+
 New-Item -ItemType Directory -Force -Path "x86" | Out-Null
 & $zig cc @warn -DD3D9SW_VARIANT=stock -target x86-windows-gnu -shared -o x86\d3d9.dll @src -lgdi32 -luser32 -lwinmm
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -150,6 +219,11 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $zig cc @warn -DD3D9SW_VARIANT=d3d11 -DSWRAST_DEFAULT_THREADS=32 -DSWRAST_THREADS_PHYSICAL -target x86-windows-gnu -shared -o x86\d3d11.dll @d3d11src -lgdi32 -luser32 -lwinmm "-Wl,--image-base=0x60000000"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   & $zig cc @warn -target x86-windows-gnu -shared -o x86\dxgi.dll dxgi_fwd.c dxgi.def "-Wl,--image-base=0x61000000"
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # The out-of-process presenter for D3D11SW_GPUHOST=1. 64-bit whatever the
+  # game is, since it never loads into the game; it ships beside the 32-bit DLL.
+  & $zig cc @warn -target x86_64-windows-gnu -o x86\gpuhost64.exe gpuhost.c -ld3d11 -ldxgi -ldxguid -luser32 "-Wl,--subsystem,windows"
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   # A same-folder dsound.dll so that Windows' never loads. Only the 32-bit one
@@ -220,14 +294,20 @@ if (Test-Path $log) {
 
 python "$PSScriptRoot\gen_gl.py"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-$glsrc = @("gl_sw.c", "gl_stubs.c", "savestate.c", "swrast.c", "trace.c", "dsoundhook.c", "ds_sw.c", "xa2_sw.c", "gameheap.c", "opengl32.def")
+$glsrc = @("gl_sw.c", "gl_fwd.c", "gl_fwd_gen.c", "gl_stubs.c", "glsl.c", "savestate.c", "swrast.c", "trace.c", "dsoundhook.c", "ds_sw.c", "xa2_sw.c", "gameheap.c", "opengl32.def")
 New-Item -ItemType Directory -Force -Path "x86" | Out-Null
 & $zig cc @warn -Wno-inconsistent-dllimport -DD3D9SW_VARIANT=gl -DSWRAST_DEFAULT_THREADS=8 -target x86-windows-gnu -shared -o x86\opengl32.dll @glsrc -lgdi32 -luser32 -lwinmm
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# Replays the DLL's GL calls on a real context and presents on the game's
+# window (glhost.h). Beside opengl32.dll it is used; without it the DLL draws
+# on the CPU.
+& $zig cc @warn -target x86_64-windows-gnu -o x86\glhost64.exe glhost.c -lopengl32 -ld3d11 -ldxgi -ldxguid -lgdi32 -luser32 "-Wl,--subsystem,windows"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $haydee = "C:\Program Files (x86)\Steam\steamapps\common\Haydee"
 if (Test-Path $haydee) {
   Copy-Item -Force x86\opengl32.dll (Join-Path $haydee "opengl32.dll")
+  Copy-Item -Force x86\glhost64.exe (Join-Path $haydee "glhost64.exe")
   Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $haydee "gl_sw.log")
   Write-Host "deployed x86 opengl32.dll to Haydee, cleared gl_sw.log"
 }

@@ -27,6 +27,12 @@ static float rndf(float lo, float hi)
 
 static uint32_t texels[TW * TH];
 
+/* Texture shape and addressing for run_case; the defaults are the original
+ * power-of-two WRAP scene. Any width * height up to TW * TH fits the texels. */
+static int g_tw = TW, g_th = TH, g_au = 1, g_av = 1;
+static float g_uvlo = -2.0f, g_uvhi = 3.0f;
+static int g_mul;
+
 static void fill_tex(void)
 {
 	int i;
@@ -50,8 +56,8 @@ static void build_scene(SwTri *tris, int n)
 			vs[k]->z = rndf(0.0f, 1.0f);
 			vs[k]->rhw = rhw;
 			vs[k]->color = col; /* flat: the configuration the kernel claims */
-			vs[k]->u = rndf(-2.0f, 3.0f);
-			vs[k]->v = rndf(-2.0f, 3.0f);
+			vs[k]->u = rndf(g_uvlo, g_uvhi);
+			vs[k]->v = rndf(g_uvlo, g_uvhi);
 		}
 	}
 }
@@ -71,9 +77,10 @@ static int run_case(const char *name, int bilinear, int blend, int dst_blend, in
 		for (i = 0; i < ntris; i++)
 			tris[i].a.color = tris[i].b.color = tris[i].c.color = 0xffffffffu;
 
-	tex.width = TW;
-	tex.height = TH;
+	tex.width = g_tw;
+	tex.height = g_th;
 	tex.pixels = texels;
+	tex.gen = 0;
 
 	swrast_state_defaults(&st);
 	st.bilinear = bilinear;
@@ -82,13 +89,19 @@ static int run_case(const char *name, int bilinear, int blend, int dst_blend, in
 	st.blend_enable = blend;
 	st.src_blend = 5; /* D3DBLEND_SRCALPHA */
 	st.dst_blend = dst_blend;
+	if (g_mul) {
+		/* Multiply with the identity fade, as d3d11_sw sets it up. */
+		st.src_blend = 1; /* D3DBLEND_ZERO */
+		st.dst_blend = 3; /* D3DBLEND_SRCCOLOR */
+		st.mul_identity = 1;
+	}
 	st.blend_op = 1; /* D3DBLENDOP_ADD */
 	st.alpha_test = alpha_test;
 	st.alpha_func = alpha_func;
 	st.alpha_ref = alpha_ref;
-	st.addr_u = 1; /* WRAP */
-	st.addr_v = 1;
-	st.cull = 1;   /* NONE */
+	st.addr_u = g_au;
+	st.addr_v = g_av;
+	st.cull = 1; /* NONE */
 
 	memset(&ra, 0, sizeof(ra));
 	memset(&rb, 0, sizeof(rb));
@@ -124,6 +137,36 @@ static int run_case(const char *name, int bilinear, int blend, int dst_blend, in
 	swrast_free(&ra);
 	swrast_free(&rb);
 	return bad == 0 && worst <= 1;
+}
+
+/* run_case on a texture of the given shape and addressing (D3DTADDRESS_*: 1
+ * wrap, 2 mirror, 3 clamp, 5 mirror once). Agreement alone would pass if the
+ * kernel declined and both runs went scalar, so this also requires the kernel
+ * to have folded some area itself. */
+static int run_fold(const char *name, int tw, int th, int au, int av, int bilinear)
+{
+	double sr[11];
+	int ok;
+
+	g_tw = tw;
+	g_th = th;
+	g_au = au;
+	g_av = av;
+	g_uvlo = -5.0f;
+	g_uvhi = 6.0f;
+	swrast_prof_simd(sr, 11);
+	ok = run_case(name, bilinear, 1, 6, 1, 6, 0, 0, 400);
+	swrast_prof_simd(sr, 11);
+	if (sr[10] <= 0.0) {
+		printf("  ^ kernel never folded (ok area %.0f)\n", sr[0]);
+		ok = 0;
+	}
+	g_tw = TW;
+	g_th = TH;
+	g_au = g_av = 1;
+	g_uvlo = -2.0f;
+	g_uvhi = 3.0f;
+	return ok;
 }
 
 /* 1:1 texel-to-pixel mapping (dudx*width == 1, dvdx == 0) with wrapping. */
@@ -268,6 +311,20 @@ int main(void)
 	ok &= run_case("point, over, atest >= 128", 0, 1, 6, 1, 7, 128, 0, 400);
 	ok &= run_case("bilinear, over, atest > 200", 1, 1, 6, 1, 5, 200, 0, 400);
 	ok &= run_case("bilinear, additive blend", 1, 1, 2, 1, 6, 0, 0, 400);
+	g_mul = 1;
+	ok &= run_case("multiply + identity fade, point", 0, 1, 6, 0, 8, 0, 0, 400);
+	ok &= run_case("multiply + identity fade, bilinear", 1, 1, 6, 0, 8, 0, 0, 400);
+	ok &= run_case("multiply + fade, white modulate", 1, 1, 6, 0, 8, 0, 1, 400);
+	ok &= run_fold("multiply + fade, npot 183x97 wrap", 183, 97, 1, 1, 1);
+	g_mul = 0;
+	ok &= run_fold("npot 200x120 wrap, point", 200, 120, 1, 1, 0);
+	ok &= run_fold("npot 200x120 wrap, bilinear", 200, 120, 1, 1, 1);
+	ok &= run_fold("npot 183x97 mirror, point", 183, 97, 2, 2, 0);
+	ok &= run_fold("npot 183x97 mirror, bilinear", 183, 97, 2, 2, 1);
+	ok &= run_fold("npot 183x97 mirror once, bilinear", 183, 97, 5, 5, 1);
+	ok &= run_fold("pow2 256x128 mirror, bilinear", 256, 128, 2, 2, 1);
+	ok &= run_fold("npot 200x120 wrap u, clamp v", 200, 120, 1, 3, 1);
+	ok &= run_fold("pow2 256x128 clamp u, mirror v", 256, 128, 3, 2, 0);
 	ok &= run_1to1("1:1 point sequential load", 0);
 	ok &= run_1to1("1:1 bilinear sequential load", 1);
 

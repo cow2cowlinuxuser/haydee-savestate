@@ -94,6 +94,7 @@ HAND = {
     "glStencilFuncSeparate",
     "glStencilOpSeparate",
     "glStencilMask",
+    "glStencilMaskSeparate",
     "glPolygonStipple",
     "glReadPixels",
     "glReadBuffer",
@@ -140,6 +141,16 @@ HAND = {
     "glEnableVertexAttribArray",
     "glDisableVertexAttribArray",
     "glVertexAttribDivisor",
+    "glVertexAttrib1f",
+    "glVertexAttrib2f",
+    "glVertexAttrib3f",
+    "glVertexAttrib4f",
+    "glVertexAttrib1fv",
+    "glVertexAttrib2fv",
+    "glVertexAttrib3fv",
+    "glVertexAttrib4fv",
+    "glVertexAttrib4Nub",
+    "glVertexAttrib4Nubv",
     "glBindAttribLocation",
     "glGetAttribLocation",
     # shaders
@@ -162,18 +173,31 @@ HAND = {
     "glUniformBlockBinding",
     "glBindFragDataLocation",
     "glUniform1i",
+    "glUniform2i",
+    "glUniform3i",
+    "glUniform4i",
+    "glUniform1ui",
     "glUniform1f",
     "glUniform2f",
     "glUniform3f",
     "glUniform4f",
     "glUniform1iv",
+    "glUniform2iv",
+    "glUniform3iv",
+    "glUniform4iv",
+    "glUniform1uiv",
     "glUniform1fv",
     "glUniform2fv",
     "glUniform3fv",
     "glUniform4fv",
-    "glUniform4fv",
-    "glUniformMatrix4fv",
+    "glUniformMatrix2fv",
     "glUniformMatrix3fv",
+    "glUniformMatrix4fv",
+    "glUniformMatrix2x3fv",
+    "glUniformMatrix3x2fv",
+    "glUniformMatrix2x4fv",
+    "glUniformMatrix4x2fv",
+    "glUniformMatrix3x4fv",
     "glUniformMatrix4x3fv",
     "glTransformFeedbackVaryings",
     "glBeginTransformFeedback",
@@ -224,6 +248,198 @@ HAND = {
     "glSamplerParameteri",
     "glSamplerParameterf",
 }
+
+
+# Forwarding to glhost64.exe (see glhost.h). Every hand-written gl* function is
+# one of:
+#   L  answered here only (queries, sync objects)
+#   H  forwarded by hand-written fw_<name> in gl_fwd.c (pointer arguments)
+#   F  forwarded instead of run here while the host is up (drawing)
+#   B  (default) run here, then forwarded - generated
+FWD_LOCAL = {
+    "glGetString", "glGetStringi", "glGetError", "glGetIntegerv", "glGetFloatv",
+    "glGetBooleanv", "glGetDoublev", "glGetIntegeri_v", "glIsEnabled", "glIsTexture",
+    "glGetTexLevelParameteriv", "glGetTexParameteriv", "glCheckFramebufferStatus",
+    "glGetShaderiv", "glGetProgramiv", "glGetShaderInfoLog", "glGetProgramInfoLog",
+    "glGetAttribLocation", "glGetUniformBlockIndex", "glFenceSync", "glClientWaitSync",
+    "glDeleteSync", "glWaitSync", "glFinish", "glFlush",
+}
+FWD_HAND = {
+    "glDrawBuffers", "glTexImage2D", "glTexSubImage2D", "glTexImage3D",
+    "glCompressedTexImage2D", "glTexParameteriv", "glTexParameterfv", "glReadPixels",
+    "glGetTexImage", "glGenTextures", "glDeleteTextures", "glGenBuffers", "glDeleteBuffers",
+    "glBufferData", "glBufferSubData", "glMapBuffer", "glMapBufferRange", "glUnmapBuffer",
+    "glGenVertexArrays", "glDeleteVertexArrays", "glVertexAttribPointer",
+    "glVertexAttribIPointer", "glVertexAttrib1fv", "glVertexAttrib2fv", "glVertexAttrib3fv",
+    "glVertexAttrib4fv", "glVertexAttrib4Nubv", "glBindAttribLocation", "glCreateShader",
+    "glShaderSource", "glCreateProgram", "glGetUniformLocation", "glBindFragDataLocation",
+    "glUniform1iv", "glUniform2iv", "glUniform3iv", "glUniform4iv", "glUniform1uiv",
+    "glUniform1fv", "glUniform2fv", "glUniform3fv", "glUniform4fv", "glUniformMatrix2fv",
+    "glUniformMatrix3fv", "glUniformMatrix4fv", "glUniformMatrix2x3fv", "glUniformMatrix3x2fv",
+    "glUniformMatrix2x4fv", "glUniformMatrix4x2fv", "glUniformMatrix3x4fv",
+    "glUniformMatrix4x3fv", "glTransformFeedbackVaryings", "glGenFramebuffers",
+    "glDeleteFramebuffers", "glGenRenderbuffers", "glDeleteRenderbuffers", "glDrawArrays",
+    "glDrawElements", "glDrawRangeElements", "glDrawArraysInstanced", "glDrawElementsInstanced",
+    "glDrawElementsBaseVertex", "glDrawElementsInstancedBaseVertex", "glMultiDrawElements",
+    "glMultiDrawElementsBaseVertex", "glPolygonStipple", "glVertex2fv", "glGenSamplers",
+    "glDeleteSamplers", "glPixelStorei", "glPixelStoref",
+}
+FWD_ONLY = {
+    "glClear", "glBlitFramebuffer", "glCopyTexSubImage2D", "glBegin", "glEnd", "glVertex2f",
+    "glVertex3f", "glTexCoord2f", "glColor4ub", "glColor4f", "glDispatchCompute",
+}
+# Replayed through hk_<name>(const uint64_t *a) in glhost.c, which keeps
+# per-context state or maps the default framebuffer.
+FB_ATTACH = re.compile(r"^glFramebuffer(Texture\w*|Renderbuffer)$")
+HOST_HOOK = {
+    "glBindFramebuffer", "glDrawBuffer", "glReadBuffer", "glUseProgram", "glLinkProgram",
+    "glCompileShader", "glDeleteShader", "glDeleteProgram", "glBindBuffer",
+}
+XL_KIND = {
+    "texture": "GLH_K_TEX", "buffer": "GLH_K_BUF", "framebuffer": "GLH_K_FBO",
+    "renderbuffer": "GLH_K_RBO", "array": "GLH_K_VAO", "program": "GLH_K_OBJ",
+    "shader": "GLH_K_OBJ", "sampler": "GLH_K_SAMP",
+}
+FLOAT_T = {"GLfloat", "GLclampf"}
+DOUBLE_T = {"GLdouble", "GLclampd"}
+SIGNED_T = {"GLint", "GLsizei", "GLshort", "GLbyte", "GLintptr", "GLsizeiptr", "GLfixed"}
+
+
+def fwd_mode(name: str) -> str:
+    if not name.startswith("gl"):
+        return ""
+    if name in FWD_LOCAL:
+        return "L"
+    if name in FWD_HAND:
+        return "H"
+    if name in FWD_ONLY:
+        return "F"
+    return "B"
+
+
+def split_args(args: str) -> list[tuple[str, str]]:
+    """(type, name) per parameter."""
+    if void_args(args):
+        return []
+    out = []
+    for p in args.split(","):
+        p = p.strip()
+        m = re.match(r"(.*?)([A-Za-z_]\w*)$", p)
+        out.append((m.group(1).strip(), m.group(2)))
+    return out
+
+
+def gen_forwarding(protos: dict) -> None:
+    gen = sorted(n for n in HAND if fwd_mode(n) in ("B", "F") and n in protos)
+    ops = ["/* Generated by gen_gl.py - do not edit. */",
+           "#ifndef GLHOST_OPS_H", "#define GLHOST_OPS_H", '#include "glhost.h"', "enum {"]
+    for i, n in enumerate(gen):
+        ops.append("\tGLH_OP_%s = GLH_OP_GEN + %d," % (n, i))
+    ops.append("\tGLH_OP_GEN_END = GLH_OP_GEN + %d" % len(gen))
+    ops.append("};")
+    ops.append("static const char *const glh_gen_names[] = {")
+    ops.extend('\t"%s",' % n for n in gen)
+    ops.append("};")
+    ops.append("#endif")
+
+    dll = ["/* Generated by gen_gl.py - do not edit. */", '#include "gl_fwd.h"',
+           '#include "glhost_ops.h"', ""]
+    host = ["/* Generated by gen_gl.py - do not edit. Included by glhost.c. */", ""]
+    # Every hand-written GL entry point gets a real function pointer on the host.
+    for n in sorted(x for x in HAND if x.startswith("gl") and x in protos):
+        ret, args = protos[n]
+        host.append("typedef %s(APIENTRY *T_%s)(%s);" % (ret, n, args))
+        host.append("static T_%s P_%s;" % (n, n))
+    host.append("")
+    host.append("static int gen_load(void)")
+    host.append("{")
+    host.append("\tint miss = 0;")
+    for n in sorted(x for x in HAND if x.startswith("gl") and x in protos):
+        host.append('\tP_%s = (T_%s)glh_proc("%s");' % (n, n, n))
+        if fwd_mode(n) in ("B", "F"):
+            host.append("\tmiss += !P_%s;" % n)
+    host.append("\treturn miss;")
+    host.append("}")
+    host.append("")
+    for n in gen:
+        if n in HOST_HOOK:
+            host.append("static void hk_%s(const uint64_t *a);" % n)
+    host.append("static int fb_is_dflt(GLenum target);")
+    host.append("")
+    host.append("static int gen_dispatch(uint32_t op, const uint64_t *a, uint32_t na)")
+    host.append("{")
+    host.append("\tswitch (op) {")
+
+    for n in gen:
+        ret, args = protos[n]
+        if ret.strip() != "void":
+            raise SystemExit("forwarded %s returns %s; make it H or L" % (n, ret))
+        params = split_args(args)
+        enc, dec = [], []
+        for i, (t, pn) in enumerate(params):
+            if "*" in t or t == "GLsync":
+                raise SystemExit("forwarded %s has pointer arg %s %s; make it H" % (n, t, pn))
+            if t in FLOAT_T:
+                enc.append("\tfa_[%d] = fw_f(%s);" % (i, pn))
+                dec.append("glh_f(a[%d])" % i)
+            elif t in DOUBLE_T:
+                enc.append("\tfa_[%d] = fw_d(%s);" % (i, pn))
+                dec.append("glh_d(a[%d])" % i)
+            elif t in SIGNED_T:
+                enc.append("\tfa_[%d] = (uint64_t)(int64_t)(%s);" % (i, pn))
+                if t == "GLint" and pn == "location":
+                    dec.append("xl_loc((GLint)(int64_t)a[%d])" % i)
+                else:
+                    dec.append("(%s)(int64_t)a[%d]" % (t, i))
+            else:
+                enc.append("\tfa_[%d] = (uint64_t)(%s);" % (i, pn))
+                if t == "GLuint" and pn in XL_KIND:
+                    dec.append("xl(%s, (GLuint)a[%d])" % (XL_KIND[pn], i))
+                else:
+                    dec.append("(%s)a[%d]" % (t, i))
+        names = ", ".join(pn for _, pn in params)
+        na = len(params)
+        dll.append("void APIENTRY %s(%s);" % (n, args))
+        dll.append("void APIENTRY fw_%s(%s)" % (n, args))
+        dll.append("{")
+        if na:
+            dll.append("\tuint64_t fa_[%d];" % na)
+        if fwd_mode(n) == "B":
+            dll.append("\t%s(%s);" % (n, names))
+            dll.append("\tif (!glfwd_on())")
+            dll.append("\t\treturn;")
+        else:
+            dll.append("\tif (!glfwd_on()) {")
+            dll.append("\t\t%s(%s);" % (n, names))
+            dll.append("\t\treturn;")
+            dll.append("\t}")
+        dll.extend(enc)
+        dll.append("\tfw_call(GLH_OP_%s, %s, %d, NULL, 0);" % (n, "fa_" if na else "NULL", na))
+        dll.append("}")
+        dll.append("")
+        host.append("\tcase GLH_OP_%s:" % n)
+        host.append("\t\tif (na < %d)" % na)
+        host.append("\t\t\treturn -1;")
+        if FB_ATTACH.match(n):
+            # The host's stand-in for framebuffer 0 must keep its attachments.
+            host.append("\t\tif (fb_is_dflt((GLenum)a[0]))")
+            host.append("\t\t\treturn 1;")
+        if n in HOST_HOOK:
+            host.append("\t\thk_%s(a);" % n)
+        else:
+            host.append("\t\tP_%s(%s);" % (n, ", ".join(dec)))
+        host.append("\t\treturn 1;")
+    host.append("\t}")
+    host.append("\treturn 0;")
+    host.append("}")
+
+    for path, lines in (("glhost_ops.h", ops), ("gl_fwd_gen.c", dll), ("glhost_gen.c", host)):
+        with open(os.path.join(ROOT, path), "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines))
+            f.write("\n")
+    print("forwarding: %d generated, %d hand, %d local" % (
+        len(gen), len([n for n in HAND if fwd_mode(n) == "H"]),
+        len([n for n in HAND if fwd_mode(n) == "L"])))
 
 
 def parse_glapi(text: str, kind: str) -> list[tuple[str, str, str, str]]:
@@ -366,6 +582,8 @@ def main() -> int:
         ret, args = protos[name]
         conv = "APIENTRY" if name.startswith("gl") else "WINAPI"
         lines.append("extern %s %s %s(%s);" % (ret, conv, name, args))
+        if fwd_mode(name) in ("B", "F", "H"):
+            lines.append("extern %s %s fw_%s(%s);" % (ret, conv, name, args))
     lines.append("")
     for name in stub_names:
         ret, args = protos[name]
@@ -392,7 +610,8 @@ int WINAPI glDebugEntry(int a, int b) { (void)a; (void)b; return 0; }
     for name in all_names:
         if name.startswith("Glmf") or name == "glDebugEntry":
             continue
-        lines.append('    { "%s", (PROC)%s },' % (name, name))
+        target = "fw_" + name if name in HAND and fwd_mode(name) in ("B", "F", "H") else name
+        lines.append('    { "%s", (PROC)%s },' % (name, target))
     lines.append("};")
     lines.append(
         "PROC gl_lookup_proc(const char *name)\n"
@@ -438,7 +657,11 @@ int WINAPI glDebugEntry(int a, int b) { (void)a; (void)b; return 0; }
     with open(def_path, "w", encoding="utf-8", newline="\n") as f:
         f.write("LIBRARY opengl32\nEXPORTS\n")
         for n in ordered:
-            f.write("%s\n" % n)
+            if n in HAND and fwd_mode(n) in ("B", "F", "H"):
+                f.write("%s=fw_%s\n" % (n, n))
+            else:
+                f.write("%s\n" % n)
+    gen_forwarding(protos)
 
     print(
         "wrote %s (%d stubs, %d hand) and %s (%d exports)"

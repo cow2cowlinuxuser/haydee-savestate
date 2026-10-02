@@ -1,0 +1,138 @@
+[
+  {
+    "id": "exit-crash-15BCA",
+    "match": "^fault: C0000005 at \\S+ in haydee\\.dll\\+15BCA[0-9A-F]",
+    "level": "ignore",
+    "meaning": "Haydee's own crash on the way out. Happens with or without a restore.",
+    "next": "Nothing - ignored by agreement.",
+    "status": "ignored"
+  },
+  {
+    "id": "build-mismatch",
+    "match": "^load: refused - the slot was saved by a different build",
+    "level": "cause",
+    "meaning": "The slot's saved stacks return into code from another build of the DLL.",
+    "next": "Save again with the current build, then load.",
+    "status": "by design"
+  },
+  {
+    "id": "transplant-unready",
+    "match": "^load: refused - (?!the slot was saved by a different build)",
+    "level": "cause",
+    "meaning": "The cross-launch transplant check said no before anything was written. The reason is on the verdict line.",
+    "next": "Read the reason on the verdict line.",
+    "status": "open"
+  },
+  {
+    "id": "newthreads-refuse",
+    "match": "^load: refused, \\d+ thread\\(s\\) newer than the save",
+    "level": "cause",
+    "meaning": "Threads started after the save, and D3D9SW_REWIND_NEWTHREADS is refuse.",
+    "next": "Set D3D9SW_REWIND_NEWTHREADS=run in the cfg.",
+    "status": "config"
+  },
+  {
+    "id": "regions-unrestorable",
+    "match": "^load: refused, \\d+ of \\d+ regions unrestorable",
+    "level": "verdict",
+    "meaning": "At least one saved region cannot be put back. The region lines in this attempt's evidence say which and why.",
+    "next": "See the cause rows below it.",
+    "status": "verdict"
+  },
+  {
+    "id": "region-elsewhere",
+    "match": "^\\s+region \\S+ now belongs elsewhere",
+    "level": "cause",
+    "meaning": "A saved region's address is inside a different allocation in this process.",
+    "next": "If it is a saved thread's stack, builds from 2026-10-02 skip it (look for xs-stack-carried). Otherwise find the allocation that took the address (a 'drift' line with that base) and who made it. Loading soon after launch avoids most of these.",
+    "status": "partly fixed"
+  },
+  {
+    "id": "region-recommit",
+    "match": "^\\s+region \\S+ cannot be recommitted",
+    "level": "cause",
+    "meaning": "A saved region's address is reserved or taken by something else and cannot be committed again.",
+    "next": "Find who holds the address now (drift lines, err code: 487 = address in use).",
+    "status": "open"
+  },
+  {
+    "id": "xs-stack-carried",
+    "match": "transplant carries it, left out",
+    "level": "info",
+    "meaning": "A saved thread's stack sat at an address taken here; skipped because the transplant copies it onto the live thread.",
+    "next": "",
+    "status": "fixed 2026-10-02"
+  },
+  {
+    "id": "dead-stack",
+    "match": "was the stack of a thread no longer here",
+    "level": "info",
+    "meaning": "Stack of a thread that exited before the save; skipped.",
+    "next": "",
+    "status": "handled"
+  },
+  {
+    "id": "cross-launch",
+    "match": "slotfile: loaded a slot taken in another session",
+    "level": "info",
+    "meaning": "This load is from a different launch (cross-launch).",
+    "next": "",
+    "status": "info"
+  },
+  {
+    "id": "handles-pinned",
+    "match": "^\\s+handles: \\d+ saved event/thread value",
+    "level": "info",
+    "meaning": "Event and thread handle values from the other launch re-pinned.",
+    "next": "Check 'held by something else' and 'failed' are 0.",
+    "status": "new 2026-10-01"
+  },
+  {
+    "id": "handle-not-pinned",
+    "match": "^\\s+handles: \\S+ \\S+ \\(saved tid \\d+\\): not pinned",
+    "level": "warn",
+    "meaning": "A saved event or thread handle could not be made to name a live object.",
+    "next": "Read the reason; a waiter on that value may hang.",
+    "status": "open"
+  },
+  {
+    "id": "snapshot-torn",
+    "match": "THE SNAPSHOT IS NOT A SINGLE MOMENT",
+    "level": "warn",
+    "meaning": "Memory changed while it was being copied, with every thread suspended.",
+    "next": "Check the VERIFY lines above for which module wrote.",
+    "status": "open"
+  },
+  {
+    "id": "pinned-span-full",
+    "match": "does not fit in the pinned span",
+    "level": "warn",
+    "meaning": "The game's reservations overflowed the pinned 511 MB span and Windows placed one - its address will differ next launch.",
+    "next": "Raise D3D9SW_GHPIN_MB or find what reserves so much.",
+    "status": "open"
+  },
+  {
+    "id": "physx-worker-wait",
+    "match": "returns to \\S+ in PhysX3Common_x86\\.dll\\+8188",
+    "level": "cause",
+    "meaning": "A PhysX worker is waiting on an event (PhysX3Common+8188). At exit after a cross-launch load this was the hang.",
+    "next": "Was there a 'handles:' line in the load? Were its counts clean?",
+    "status": "fix pending test"
+  },
+  {
+    "id": "stall",
+    "match": "^stall: no frame for",
+    "level": "verdict",
+    "meaning": "No frame presented for a while; every thread's stack follows.",
+    "next": "Look at which threads are in a wait and what called the wait.",
+    "status": "verdict"
+  },
+  {
+    "id": "exclforce",
+    "match": "EXCLFORCE: \\d+ of \\d+ region\\(s\\) are unrestorable",
+    "level": "warn",
+    "meaning": "Load went ahead over unrestorable regions on purpose (EXCLFORCE).",
+    "next": "Expect trouble; the region lines say which.",
+    "status": "debug setting"
+  }
+]

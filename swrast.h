@@ -22,6 +22,10 @@ typedef struct SwTex {
 	int width;
 	int height;
 	const uint32_t *pixels;
+	/* Content generation, bumped by the caller whenever the texels change
+	 * under the same pointer. Read only by the paint statistics, to tell a
+	 * tile that draws the same thing from one that draws a new frame of it. */
+	unsigned gen;
 } SwTex;
 
 typedef struct SwTri {
@@ -81,6 +85,14 @@ void swrast_clear_depth(SwRast *r, float z);
 void swrast_triangles(SwRast *r, const SwTri *tris, int count, const SwTex *tex,
 		      const SwState *st);
 int swrast_thread_count(void);
+#define SWRAST_MAX_THREADS 32
+/* Runs fn(arg, worker, job) for job 0..njobs-1 on up to max_threads threads,
+ * the caller included, and returns when all are done. worker is below
+ * SWRAST_JOB_SLOTS and no two concurrent calls share one. Returns the number of
+ * threads that took part. Must not overlap a flush. */
+#define SWRAST_JOB_SLOTS (SWRAST_MAX_THREADS + 1)
+int swrast_parallel(int njobs, int max_threads, void (*fn)(void *arg, int worker, int job),
+		    void *arg);
 /* Retires the worker pool; the next flush recreates it. */
 void swrast_pool_shutdown(void);
 /* Rasterise everything recorded so far. Required before any read of, or write
@@ -101,12 +113,44 @@ void swrast_prof_take2(double *area, double *bbox, int *tw, int *th);
 void swrast_prof_mix(double *out, int n);
 /* Clipped area accepted by the AVX2 span kernel, and the area each gate turned
  * away: ok, no-avx2, untextured, non-flat colour, depth, mask, blend mode,
- * non-power-of-two texture, addressing mode, other. */
+ * non-power-of-two texture, addressing mode, other. An eleventh entry, not a
+ * reason and not part of the total, is the accepted area folded by wrap or
+ * mirror at any dimensions. */
 void swrast_prof_simd(double *out, int n);
 
 /* Names the blend states that fell off the vector path, worst area first.
  * Returns how many were filled in. */
 int swrast_prof_blend_other(int *op, int *src, int *dst, double *area, int n);
+
+/* Paint statistics: how much of the shaded area is work that changes nothing.
+ * Off unless swrast_paintstat is set; N > 1 measures two consecutive frames in
+ * every N, so the tile comparison always spans adjacent frames.
+ *
+ * Every shaded pixel lands in exactly one of KILLED (alpha or depth test
+ * failed after the texel was fetched), ZERO (alpha 0 under over or add), NOOP
+ * (add of black, multiply by white), OPAQUE (replaces the destination) or RMW
+ * (a real blend). HIDDEN counts earlier writes to a pixel that a later OPAQUE
+ * write in the same frame buried, before anything sampled the target. VEC and
+ * FULL8 are the vector-path pixels and those in full 8-lane groups; UNIFORM is
+ * the part of FULL8 whose eight source colours were identical, split into
+ * UNIF_CLEAR (alpha 0), UNIF_OPAQUE (alpha 255) and, by difference,
+ * translucent. The TILE rows
+ * compare each 64px tile's draw list against the previous frame's; the RECT
+ * rows are clipped screen area drawn as axis-aligned two-triangle quads, split
+ * by texel scale, and FULL those that cover their whole target. */
+enum {
+	SWPS_SHADED, SWPS_KILLED, SWPS_ZERO, SWPS_NOOP, SWPS_OPAQUE, SWPS_RMW,
+	SWPS_HIDDEN, SWPS_VEC, SWPS_FULL8, SWPS_UNIFORM, SWPS_UNIF_CLEAR, SWPS_UNIF_OPAQUE,
+	SWPS_TILES, SWPS_TILES_SAME, SWPS_TILE_PX, SWPS_TILE_PX_SAME,
+	SWPS_TGT_FRAMES, SWPS_TGT_STATIC,
+	SWPS_RECT, SWPS_RECT_1TO1, SWPS_RECT_INT, SWPS_RECT_FULL, SWPS_RECT_FULL_N,
+	SWPS_FRAMES, SWPS_N
+};
+extern int swrast_paintstat;
+/* Call once per presented frame, after the last draw of it. */
+void swrast_paintstat_frame(void);
+/* Reads and zeroes SWPS_N totals. */
+void swrast_prof_paint(double *out);
 
 /* Hardware backend. Presents the finished software frame through a real
  * swapchain, or returns 0 if no device is up and the caller should present the

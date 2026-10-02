@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Savestate attempts</title>
+<style>
+  :root {
+    --bg: #12141a; --bg2: #1a1d24; --bg3: #22262f;
+    --ink: #d7dde8; --muted: #8b93a3; --line: #2c3340;
+    --accent: #c8a35a; --bad: #d4655a; --ok: #6aae8b; --warn: #d0a34a; --new: #e070c0;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.45 "Segoe UI", system-ui, sans-serif; }
+  header { position: sticky; top: 0; z-index: 2; display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+           padding: 10px 16px; background: var(--bg2); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  header a { color: var(--accent); }
+  input[type="search"] { background: var(--bg3); color: var(--ink); border: 1px solid var(--line); padding: 5px 8px; border-radius: 3px; width: 260px; }
+  label { color: var(--muted); display: inline-flex; gap: 5px; align-items: center; }
+  main { padding: 12px 16px 40px; max-width: 1400px; }
+  .sess { background: var(--bg2); border: 1px solid var(--line); margin: 0 0 12px; }
+  .sess > .head { padding: 8px 12px; display: flex; gap: 14px; flex-wrap: wrap; align-items: baseline; border-bottom: 1px solid var(--line); }
+  .sess .when { font-weight: 600; color: var(--accent); }
+  .sess .meta { color: var(--muted); font-size: 12px; }
+  .changes { padding: 6px 12px; font-size: 12px; color: var(--accent); border-bottom: 1px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 4px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr.row { cursor: pointer; }
+  tr.row:hover td { background: var(--bg3); }
+  td.ln { color: var(--muted); font-family: Consolas, monospace; width: 80px; }
+  td.what { width: 260px; }
+  td.st { width: 120px; }
+  .badge { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+  .s-ok { background: #1f3a2e; color: var(--ok); }
+  .s-warn { background: #3a3320; color: var(--warn); }
+  .s-known { background: #3a2422; color: var(--bad); }
+  .s-new { background: #3a1f35; color: var(--new); }
+  .s-ign { background: var(--bg3); color: var(--muted); }
+  .chip { display: inline-block; margin: 0 6px 2px 0; font-size: 11px; color: var(--muted); }
+  .chip.cause { color: var(--bad); } .chip.warn { color: var(--warn); } .chip.ignore { color: var(--muted); }
+  tr.ev td { background: var(--bg); padding: 8px 12px 12px 104px; }
+  .verdict, .q { font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
+  .verdict { color: var(--ink); margin-bottom: 8px; }
+  .hit { margin: 8px 0; }
+  .hit .t { font-weight: 600; }
+  .hit .m { color: var(--muted); }
+  .hit .n { color: var(--accent); }
+  .q { color: #c5cdd8; background: var(--bg2); padding: 6px 8px; margin-top: 4px; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 24px 0 8px; }
+  table.rules td { font-size: 12px; }
+  .empty { color: var(--muted); padding: 8px 12px; }
+  .bnd { padding: 8px 12px 10px; border-bottom: 1px solid var(--line); background: #161920; }
+  .bnd .title { font-weight: 700; font-size: 14px; letter-spacing: 0.04em; margin-bottom: 6px; }
+  .bnd .acc { font-weight: 700; font-size: 14px; margin-top: 6px; }
+  .bnd table td, .bnd table th { font-family: Consolas, "Cascadia Mono", monospace; font-size: 13px; padding: 3px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+  .bnd table th { color: var(--muted); font-weight: 600; font-family: "Segoe UI", sans-serif; font-size: 11px; text-transform: uppercase; }
+  .bnd td.big { font-size: 15px; font-weight: 700; }
+  .bnd tr.one td.res { color: var(--ok); } .bnd tr.many td.res { color: var(--warn); } .bnd tr.none td.res { color: var(--bad); }
+  .bnd td.det { color: var(--muted); font-size: 11px; font-family: "Segoe UI", sans-serif; }
+  .agree { color: var(--ok); font-weight: 700; } .differ { color: var(--bad); font-weight: 700; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Savestate attempts</h1>
+    <div class="sub" id="status"></div>
+  </div>
+  <label><input type="checkbox" id="problems" checked> problems only</label>
+  <input type="search" id="q" placeholder="filter: rule, address, text" />
+  <a href="connections.html">connection graph</a>
+</header>
+<main id="main"></main>
+<script>
+window.ATTEMPT_DATA = __ATTEMPT_DATA__;
+</script>
+<script>
+(function () {
+  const D = window.ATTEMPT_DATA || { sessions: [], rules: [] };
+  const RULES = {};
+  (D.rules || []).forEach(r => RULES[r.id] = r);
+  const main = document.getElementById("main");
+  const q = document.getElementById("q");
+  const problems = document.getElementById("problems");
+  document.getElementById("status").textContent =
+    D.sessions.length + " launch(es) from " + D.gameRoot + " - generated " + D.generatedAt +
+    " - every row and line is quoted from the log";
+
+  const esc = s => String(s == null ? "" : s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const statusClass = s => s === "ok" ? "s-ok" : s === "NEW" ? "s-new" : s === "known" ? "s-known"
+    : s === "ignored" ? "s-ign" : "s-warn";
+  const isProblem = a => !(a.status === "ok" || a.status === "ignored");
+
+  function text(a) {
+    return [a.kind, a.status, a.text].concat(a.hits.map(h => h.rule + " " + h.lines.join(" "))).join(" ").toLowerCase();
+  }
+
+  function render() {
+    const needle = q.value.trim().toLowerCase();
+    const onlyBad = problems.checked;
+    main.innerHTML = "";
+    let shown = 0;
+    D.sessions.forEach(s => {
+      const rows = s.attempts.filter(a => (!onlyBad || isProblem(a)) && (!needle || text(a).includes(needle)));
+      const bnd = s.boundary || [];
+      if (!rows.length && !bnd.length && (onlyBad || needle) && !(s.changes.length && !needle)) return;
+      shown++;
+      const box = document.createElement("section");
+      box.className = "sess";
+      box.innerHTML =
+        '<div class="head"><a class="when" href="' + esc(s.logFile) + '" target="_blank" title="this run\'s whole log (starts at L' + s.firstLine + ' of ' + esc(s.file) + ')">' + esc(s.when) + '</a>' +
+        '<span class="meta">pid ' + esc(s.pid) + ' - ' + esc(s.file) + ' - build ' + esc(s.build || "?") + '</span>' +
+        '<span>' + esc(s.outcome) + '</span></div>' +
+        (s.changes.length ? '<div class="changes">changed since the launch before: ' + s.changes.map(esc).join(" - ") + '</div>' : "") +
+        bnd.map(boundary).join("");
+      if (!rows.length) {
+        box.insertAdjacentHTML("beforeend", '<div class="empty">' + s.attempts.length + ' attempt(s), none shown by the filter</div>');
+      } else {
+        const t = document.createElement("table");
+        rows.forEach(a => {
+          const tr = document.createElement("tr");
+          tr.className = "row";
+          const what = a.kind + (a.cross ? " (cross-launch)" : "") + (a.slot ? " slot " + a.slot : "");
+          const chips = a.hits.filter(h => h.level !== "info" && h.level !== "verdict")
+            .map(h => '<span class="chip ' + h.level + '">' + esc(h.rule) + ' x' + h.count + '</span>').join("");
+          tr.innerHTML = '<td class="ln">L' + a.line + '</td><td class="what">' + esc(what) + '</td>' +
+            '<td class="st"><span class="badge ' + statusClass(a.status) + '">' + esc(a.status) + '</span></td>' +
+            '<td>' + (chips || '<span class="chip">' + esc(a.text) + '</span>') + '</td>';
+          const ev = document.createElement("tr");
+          ev.className = "ev";
+          ev.style.display = "none";
+          ev.innerHTML = '<td colspan="4">' + evidence(a) + '</td>';
+          tr.onclick = () => { ev.style.display = ev.style.display === "none" ? "" : "none"; };
+          t.appendChild(tr);
+          t.appendChild(ev);
+        });
+        box.appendChild(t);
+      }
+      main.appendChild(box);
+    });
+    if (!shown) main.innerHTML = '<div class="empty">nothing matches</div>';
+    main.insertAdjacentHTML("beforeend", rulesTable());
+  }
+
+  function boundary(r) {
+    const live = {};
+    (r.live || []).forEach(l => live[l.n] = l);
+    if (r.kind === "save") {
+      let h = '<div class="bnd"><div class="title">BOUNDARY SAMPLES TAKEN AT THE SAVE (L' + r.line + ')</div><table>' +
+        '<tr><th>#</th><th>holder</th><th>wants</th><th>heap</th><th>into heap</th><th>pointer mask</th></tr>';
+      r.rows.forEach(x => {
+        h += '<tr><td class="big">' + esc(x.n) + '</td><td>' + esc(x.holder) + '</td><td class="big">' + esc(x.wants) +
+          '</td><td>' + esc(x.heap) + ' <span class="det">' + esc(x.heapName) + '</span></td><td>+' + esc(x.into) +
+          '</td><td>' + esc(x.mask) + '</td></tr>';
+      });
+      return h + '</table></div>';
+    }
+    let h = '<div class="bnd"><div class="title">BOUNDARY AT THE CROSS-LAUNCH LOAD (L' + r.line + ')</div>';
+    if (r.rows.length) {
+      h += '<table><tr><th>#</th><th>heap</th><th>wants</th><th>actual</th><th>offset</th><th>search</th><th>live at holder</th><th>live vs search</th></tr>';
+      r.rows.forEach(x => {
+        const m = /^(\d+) match/.exec(x.note);
+        const k = m ? +m[1] : 0;
+        const cls = k === 1 ? "one" : k > 1 ? "many" : "none";
+        const l = live[x.n];
+        const lv = l ? (/AGREES/.test(l.note) ? '<span class="agree">AGREES</span>'
+          : /DIFFERS/.test(l.note) ? '<span class="differ">DIFFERS</span>' : '<span class="det">' + esc(l.note) + '</span>') : "";
+        h += '<tr class="' + cls + '"><td class="big">' + esc(x.n) + '</td><td>' + esc(x.heap) + '</td><td class="big">' + esc(x.wants) +
+          '</td><td class="big res">' + esc(x.actual) + '</td><td class="big res">' + esc(x.offset) + '</td><td class="res">' + esc(x.note) +
+          '</td><td>' + (l ? esc(l.live) + (l.offset ? ' (' + esc(l.offset) + ')' : "") : "") + '</td><td>' + lv + '</td></tr>';
+        if (x.detail) h += '<tr class="' + cls + '"><td></td><td colspan="7" class="det">saved in ' + esc(x.detail) + '</td></tr>';
+      });
+      h += '</table>';
+    }
+    if (r.accuracy) h += '<div class="acc">ACCURACY: ' + esc(r.accuracy) + '</div>';
+    return h + '</div>';
+  }
+
+  function evidence(a) {
+    let h = '<div class="verdict">L' + a.line + ': ' + esc(a.text) + '</div>';
+    if (a.status === "NEW")
+      h += '<div class="hit"><span class="t" style="color:var(--new)">No rule explains this.</span> ' +
+           '<span class="m">Read the lines above L' + a.line + ' in the log; once understood, add a rule to signatures.json.</span></div>';
+    const order = { ignore: 0, cause: 1, warn: 2, verdict: 3, info: 4 };
+    a.hits.slice().sort((x, y) => order[x.level] - order[y.level]).forEach(x => {
+      const r = RULES[x.rule] || {};
+      h += '<div class="hit"><span class="t">' + esc(x.rule) + '</span> <span class="m">(' + esc(x.level) + ', ' + esc(r.status || "") + ', ' + x.count + ' line(s))</span>' +
+        (r.meaning ? '<div>' + esc(r.meaning) + '</div>' : "") +
+        (r.next ? '<div class="n">next: ' + esc(r.next) + '</div>' : "") +
+        '<div class="q">' + x.lines.map(esc).join("\n") + (x.count > x.lines.length ? "\n... " + (x.count - x.lines.length) + " more" : "") + '</div></div>';
+    });
+    return h;
+  }
+
+  function rulesTable() {
+    const seen = {}, last = {};
+    D.sessions.forEach(s => s.attempts.forEach(a => a.hits.forEach(h => {
+      seen[h.rule] = (seen[h.rule] || 0) + h.count;
+      if (!last[h.rule]) last[h.rule] = s.when;
+    })));
+    let h = '<h2>Rules (signatures.json) - how often each matched, and the last launch it did</h2><table class="rules">';
+    (D.rules || []).forEach(r => {
+      h += '<tr><td style="width:180px">' + esc(r.id) + '</td><td style="width:70px">' + esc(r.level) + '</td>' +
+        '<td style="width:120px">' + esc(r.status) + '</td><td style="width:60px">' + (seen[r.id] || 0) + '</td>' +
+        '<td style="width:150px">' + esc(last[r.id] || "never") + '</td><td>' + esc(r.meaning) + '</td></tr>';
+    });
+    return h + '</table>';
+  }
+
+  q.oninput = render;
+  problems.onchange = render;
+  render();
+})();
+</script>
+</body>
+</html>

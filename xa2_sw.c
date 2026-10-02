@@ -128,9 +128,11 @@ struct SwVoice {
 	float freq_ratio, volume;
 	double rate_eff; /* samples per second after the frequency ratio */
 	int started;
+	int bstart;	 /* OnBufferStart already raised for the head buffer */
+	int pass_q;	 /* a processing-pass request is queued and not yet delivered */
 	LONGLONG anchor; /* rewound QPC at which `played` and `pos` were current */
 	UINT64 played;	 /* samples, the number the game asks for */
-	UINT32 pos;	 /* samples into the buffer at the head of the queue */
+	UINT32 pos;	 /* sample index into the head buffer, absolute like PlayBegin */
 	UINT32 frac;	 /* 16.16 remainder of pos, for rate conversion */
 	int head, n;
 	/* Panning arrives as an output matrix rather than a pan value, so it is
@@ -140,7 +142,49 @@ struct SwVoice {
 	int chvol_n;
 	float chvol[8];
 	XA2_BUFFER q[XA2_MAX_QUEUED];
+	/* pcm_sum of each queued buffer's data as submitted; 0 marks one whose
+	 * bytes a restore found changed, which then plays as silence. */
+	UINT32 qsum[XA2_MAX_QUEUED];
 };
+
+/* See submit_audit. */
+static int g_sub_audit, g_sub_ok, g_sub_held, g_sub_outside, g_sub_said;
+static UINT_PTR g_sub_seen[16];
+
+/* Whether [p, p+n) is committed and readable, so a restored buffer pointer can
+ * be looked at without faulting. */
+static int pcm_readable(const BYTE *p, UINT32 n)
+{
+	const BYTE *end = p + n;
+
+	while (p < end) {
+		MEMORY_BASIC_INFORMATION mbi;
+		const BYTE *top;
+
+		if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+		    (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+		    !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+				     PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+			return 0;
+		top = (const BYTE *)mbi.BaseAddress + mbi.RegionSize;
+		p = top;
+	}
+	return 1;
+}
+
+/* FNV-1a over the first and last 256 bytes and the length. Never 0. */
+static UINT32 pcm_sum(const BYTE *p, UINT32 n)
+{
+	UINT32 h = 2166136261u ^ n, i, k = n < 256 ? n : 256;
+
+	if (!p || !n)
+		return 1;
+	for (i = 0; i < k; i++)
+		h = (h ^ p[i]) * 16777619u;
+	for (i = n - k; i < n; i++)
+		h = (h ^ p[i]) * 16777619u;
+	return h ? h : 1;
+}
 
 typedef struct {
 	const void **vtbl;
@@ -214,13 +258,43 @@ void xa2_sw_trace_dump(void (*emit)(const char *))
 	}
 }
 
-/* A roster the mixer can walk. Static, so it lives in this DLL's data and is
- * held in the present - which is right: who exists is present tense, while what
- * each voice contains is state and stays captured in the arena. A voice created
- * after a save rewinds to zeroed arena memory, so `alive` reads false and the
- * mixer steps over it rather than playing something that no longer happened. */
-static SwVoice *g_vtab[XA2_MAX_VOICES];
-static int g_vn;
+/* A roster the mixer can walk, kept in the arena's header with the allocation
+ * cursor, so both rewind with the voices they describe. Within a session that
+ * changes nothing that matters: a voice created after the save drops out of the
+ * rewound roster, and its memory is handed out again. Across sessions it is the
+ * only arrangement that works, because the game comes back holding the old
+ * launch's voice pointers, and the roster, the cursor and the voices have to
+ * agree with them rather than with whatever this launch made at start-up. */
+#define XA2_PEND 256
+
+typedef struct {
+	XA2Callback *cb;
+	SwVoice *v;
+	int slot;
+	void *ctx;
+	int epoch; /* the generation the posting voice was born in */
+} Pending;
+
+typedef struct XaHead {
+	unsigned char *cur, *end;
+	int vn;
+	SwVoice *vtab[XA2_MAX_VOICES];
+	/* Notifications not yet delivered to the game. They rewind with the
+	 * voices and the game's memory, so a restore delivers exactly the ones
+	 * that were pending at the save - each about something that had already
+	 * happened inside the snapshot, which the restored game has not yet been
+	 * told. */
+	int pend_head, pend_n;
+	Pending pend[XA2_PEND];
+} XaHead;
+
+static XaHead g_xa_boot;
+static XaHead *g_xa = &g_xa_boot;
+#define g_vtab (g_xa->vtab)
+#define g_vn (g_xa->vn)
+#define g_pend (g_xa->pend)
+#define g_pend_head (g_xa->pend_head)
+#define g_pend_n (g_xa->pend_n)
 
 /* Set once waveOut is running. Declared here because `advance` has to know to
  * stand aside well before the mixer that sets it is defined. */
@@ -229,8 +303,6 @@ static int g_out_live;
 static CRITICAL_SECTION g_cs;
 static int g_ready;
 static LONGLONG g_qpf;
-static unsigned char *g_chunk;
-static SIZE_T g_chunk_left;
 static unsigned long g_voices, g_submits, g_starved, g_overflow;
 static int g_over_said;
 
@@ -262,28 +334,68 @@ unsigned savestate_getenv(const char *name, char *buf, unsigned cap);
  * rewinds with the game, which is the correct owner for it. */
 #define XA2_CHUNK (1u * 1024u * 1024u)
 
+/* One reservation at the same address in every launch, just under the wrapper
+ * DLL's pinned base, so a voice pointer the game saved in one launch names the
+ * same memory in the next. Reserved on first use, before the game has created
+ * anything, and committed as the cursor advances. */
+#define XA2_ARENA_BASE 0x5E000000u
+#define XA2_ARENA_SIZE (32u * 1024u * 1024u)
+
+/* Audio state rewinds with the game; keep SWEXCLUDE from holding each piece of
+ * it in the present, which malforms the PCM stream. */
+static int arena_commit(unsigned char *p, SIZE_T n)
+{
+	void *c = VirtualAlloc(p, n, MEM_COMMIT, PAGE_READWRITE);
+
+	if (!c)
+		return 0;
+	gameheap_va_unhold(c);
+	return 1;
+}
+
+static int arena_open(void)
+{
+	unsigned char *base;
+	SIZE_T size = XA2_ARENA_SIZE;
+
+	base = (unsigned char *)VirtualAlloc((void *)(UINT_PTR)XA2_ARENA_BASE, size,
+					     MEM_RESERVE, PAGE_READWRITE);
+	if (base) {
+		gameheap_va_unhold(base);
+		ss_log("xa2_sw: voice arena reserved at %p, %u MB - the same address "
+		       "in every launch\n",
+		       base, (unsigned)(size >> 20));
+	} else {
+		size = XA2_CHUNK * 8;
+		base = (unsigned char *)VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_READWRITE);
+		if (!base)
+			return 0;
+		gameheap_va_unhold(base);
+		ss_log("xa2_sw: %p was taken, voice arena at %p instead - voices will "
+		       "not survive a load from another launch\n",
+		       (void *)(UINT_PTR)XA2_ARENA_BASE, base);
+	}
+	if (!arena_commit(base, sizeof(XaHead)))
+		return 0;
+	g_xa = (XaHead *)base;
+	g_xa->cur = base + ((sizeof(XaHead) + 15) & ~(SIZE_T)15);
+	g_xa->end = base + size;
+	return 1;
+}
+
 static void *arena_alloc(SIZE_T n)
 {
-	void *p;
+	unsigned char *p;
 
+	if (g_xa == &g_xa_boot && !arena_open())
+		return NULL;
 	n = (n + 15) & ~(SIZE_T)15;
-	if (n > g_chunk_left) {
-		SIZE_T want = n > XA2_CHUNK ? n : XA2_CHUNK;
-
-		p = VirtualAlloc(NULL, want, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-		if (!p)
-			return NULL;
-		/* Audio buffers rewind with the game; keep SWEXCLUDE from holding them
-		 * in the present, which malforms the PCM stream. */
-		gameheap_va_unhold(p);
-		if (n > XA2_CHUNK)
-			return p;
-		g_chunk = (unsigned char *)p;
-		g_chunk_left = want;
-	}
-	p = g_chunk;
-	g_chunk += n;
-	g_chunk_left -= n;
+	if (n > (SIZE_T)(g_xa->end - g_xa->cur))
+		return NULL;
+	p = g_xa->cur;
+	if (!arena_commit(p, n))
+		return NULL;
+	g_xa->cur += n;
 	return p;
 }
 
@@ -311,20 +423,8 @@ static LONGLONG now_qpc(void)
  * So the mixer only records what happened. The game's next call into us drains
  * the queue on the game's own thread, which is a frame of latency at worst and
  * keeps the invariant that nothing but the game ever calls the game. The queue
- * is static, so it lives in this DLL's data, which is held in the present -
- * correct, because a pending notification is about the present and not part of
- * the state being rewound. */
-#define XA2_PEND 256
-
-typedef struct {
-	XA2Callback *cb;
-	int slot;
-	void *ctx;
-	int epoch; /* the generation the posting voice was born in */
-} Pending;
-
-static Pending g_pend[XA2_PEND];
-static int g_pend_head, g_pend_n;
+ * lives in the arena header (see XaHead), so it rewinds with the state it
+ * describes. */
 /* Two reasons a callback never runs, and they mean opposite things.
  *
  * Dropped at the park is by design: a callback queued before a rewind is about
@@ -334,7 +434,6 @@ static int g_pend_head, g_pend_n;
  * is why a jump from 32 to 505 could not be read: it was either twenty parks
  * behaving normally or the ring saturating once, and the number could not say
  * which. */
-static unsigned long g_pend_lost;
 static unsigned long g_pend_full;
 
 /* Dropping the queued entries at the park closes one hole and leaves its twin
@@ -406,6 +505,7 @@ static void cb_post(SwVoice *v, int slot, void *ctx)
 	}
 	at = (g_pend_head + g_pend_n) % XA2_PEND;
 	g_pend[at].cb = v->cb;
+	g_pend[at].v = v;
 	g_pend[at].slot = slot;
 	g_pend[at].ctx = ctx;
 	g_pend[at].epoch = v->epoch; /* the generation to check when it is drained */
@@ -435,6 +535,8 @@ static void cb_flush(void)
 		p = g_pend[g_pend_head];
 		g_pend_head = (g_pend_head + 1) % XA2_PEND;
 		g_pend_n--;
+		if (p.slot == CB_PASS_END && p.v)
+			p.v->pass_q = 0;
 		LeaveCriticalSection(&g_cs);
 		/* Two of these take no argument at all, and calling them as if they
 		 * did would unbalance a stdcall stack. OnVoiceProcessingPassStart
@@ -493,11 +595,51 @@ static void cb_void(SwVoice *v, int slot)
 
 /* ---------------------------------------------------------------- clock */
 
-static UINT32 buf_samples(const SwVoice *v, const XA2_BUFFER *b)
+/* Positions are sample indexes into the buffer, the frame XAudio2 defines
+ * PlayBegin and LoopBegin in: LoopBegin is not relative to PlayBegin and may
+ * lie before it. Keeping pos relative and adding PlayBegin at the read put a
+ * loop back into the wrong stretch of audio whenever both were set. */
+static UINT32 play_end(const SwVoice *v, const XA2_BUFFER *b)
 {
-	if (b->PlayLength)
-		return b->PlayLength;
-	return v->block ? b->AudioBytes / v->block : 0;
+	UINT32 all = v->block ? b->AudioBytes / v->block : 0;
+	UINT32 e = b->PlayLength ? b->PlayBegin + b->PlayLength : all;
+
+	return e > all ? all : e;
+}
+
+/* Where the head buffer stops for now: its loop end while loops remain,
+ * otherwise the end of its play region. */
+static UINT32 seg_end(const SwVoice *v, const XA2_BUFFER *b)
+{
+	UINT32 e = play_end(v, b);
+
+	if (b->LoopCount) {
+		UINT32 le = b->LoopLength ? b->LoopBegin + b->LoopLength : e;
+
+		if (le < e)
+			e = le;
+	}
+	return e;
+}
+
+static int can_loop(const SwVoice *v, const XA2_BUFFER *b)
+{
+	return b->LoopCount && b->LoopBegin < seg_end(v, b);
+}
+
+/* The head of the queue changed: start at its PlayBegin. */
+static void head_enter(SwVoice *v)
+{
+	v->pos = v->n ? v->q[v->head].PlayBegin : 0;
+	v->frac = 0;
+	v->bstart = 0;
+}
+
+static void head_retire(SwVoice *v)
+{
+	v->head = (v->head + 1) % XA2_MAX_QUEUED;
+	v->n--;
+	head_enter(v);
 }
 
 /* Move the voice forward to now, retiring buffers and firing the callbacks the
@@ -537,25 +679,21 @@ static void advance(SwVoice *v)
 			break;
 		}
 		b = &v->q[v->head];
-		total = buf_samples(v, b);
+		total = play_end(v, b);
 		if (!total) {
 			cb_ctx(v, CB_BUFFER_END, b->pContext);
-			v->head = (v->head + 1) % XA2_MAX_QUEUED;
-			v->n--;
-			v->pos = 0;
+			head_retire(v);
 			continue;
 		}
-		if (v->pos == 0)
+		if (!v->bstart) {
 			cb_ctx(v, CB_BUFFER_START, b->pContext);
+			v->bstart = 1;
+		}
 
 		/* A looping buffer ends at the loop point, not at the buffer end. BGM
 		 * lives on this path, and getting it wrong would retire the music
 		 * after one pass. */
-		end = total;
-		if (b->LoopCount && b->LoopLength)
-			end = b->LoopBegin + b->LoopLength;
-		if (end > total)
-			end = total;
+		end = seg_end(v, b);
 		avail = end > v->pos ? end - v->pos : 0;
 		take = (UINT32)(s < avail ? s : avail);
 		v->pos += take;
@@ -563,13 +701,9 @@ static void advance(SwVoice *v)
 		s -= take;
 		if (v->pos < end)
 			break;
-		if (b->LoopCount == XA2_LOOP_INFINITE) {
-			cb_ctx(v, CB_LOOP_END, b->pContext);
-			v->pos = b->LoopBegin;
-			continue;
-		}
-		if (b->LoopCount) {
-			b->LoopCount--;
+		if (can_loop(v, b)) {
+			if (b->LoopCount != XA2_LOOP_INFINITE)
+				b->LoopCount--;
 			cb_ctx(v, CB_LOOP_END, b->pContext);
 			v->pos = b->LoopBegin;
 			continue;
@@ -577,9 +711,7 @@ static void advance(SwVoice *v)
 		cb_ctx(v, CB_BUFFER_END, b->pContext);
 		if (b->Flags & XA2_END_OF_STREAM)
 			cb_void(v, CB_STREAM_END);
-		v->head = (v->head + 1) % XA2_MAX_QUEUED;
-		v->n--;
-		v->pos = 0;
+		head_retire(v);
 	}
 }
 
@@ -667,17 +799,13 @@ static void mix_voice(SwVoice *v, int *acc, unsigned frames)
 			return;
 		}
 		b = &v->q[v->head];
-		total = buf_samples(v, b);
-		end = total;
-		if (b->LoopCount && b->LoopLength)
-			end = b->LoopBegin + b->LoopLength;
-		if (end > total)
-			end = total;
+		total = play_end(v, b);
+		end = seg_end(v, b);
 
 		if (!total || v->pos >= end) {
 			/* Retire or loop, then take this output frame again from
 			 * whatever is next. */
-			if (total && b->LoopCount) {
+			if (total && can_loop(v, b)) {
 				if (b->LoopCount != XA2_LOOP_INFINITE)
 					b->LoopCount--;
 				cb_ctx(v, CB_LOOP_END, b->pContext);
@@ -686,20 +814,20 @@ static void mix_voice(SwVoice *v, int *acc, unsigned frames)
 				cb_ctx(v, CB_BUFFER_END, b->pContext);
 				if (b->Flags & XA2_END_OF_STREAM)
 					cb_void(v, CB_STREAM_END);
-				v->head = (v->head + 1) % XA2_MAX_QUEUED;
-				v->n--;
-				v->pos = 0;
-				v->frac = 0;
+				head_retire(v);
 			}
 			f--;
 			continue;
 		}
-		if (v->pos == 0 && v->frac == 0)
+		if (!v->bstart) {
 			cb_ctx(v, CB_BUFFER_START, b->pContext);
+			v->bstart = 1;
+		}
 
-		idx = b->PlayBegin + v->pos;
+		idx = v->pos;
 		s16 = (const short *)b->pAudioData;
-		if (!s16 || v->bits != 16 || (idx + 1) * v->block > b->AudioBytes) {
+		if (!s16 || !v->qsum[v->head] || v->bits != 16 ||
+		    (idx + 1) * v->block > b->AudioBytes) {
 			/* Anything we cannot read confidently contributes silence. The
 			 * buffer still advances, so a format we do not handle costs the
 			 * sound and not the timing. */
@@ -744,6 +872,13 @@ static void pass_callbacks(unsigned frames)
 
 		if (!v || !v->alive || !v->started || v->kind != 0 || !v->cb)
 			continue;
+		/* One request outstanding per voice. Every block used to post a
+		 * fresh one with the same shortfall, so a game thread that drained
+		 * late answered the same need two or three times over. Real XAudio2
+		 * asks synchronously and never has this problem; with the request
+		 * deferred, the next one waits until the last has been delivered. */
+		if (v->pass_q || g_pend_n > XA2_PEND - 2)
+			continue;
 		/* Ask far enough ahead to cover the round trip, not just the next
 		 * block. A request is posted here, drained on the game's thread a
 		 * frame later, and only then decoded and submitted - so asking for one
@@ -759,19 +894,23 @@ static void pass_callbacks(unsigned frames)
 				1.0);
 		for (k = 0; k < v->n; k++) {
 			const XA2_BUFFER *b = &v->q[(v->head + k) % XA2_MAX_QUEUED];
-			UINT32 total = buf_samples(v, b);
+			UINT32 end = play_end(v, b);
 
 			if (b->LoopCount) {
 				have = need; /* a looping buffer never runs out */
 				break;
 			}
-			have += k == 0 && total > v->pos ? total - v->pos : total;
+			if (k == 0)
+				have += end > v->pos ? end - v->pos : 0;
+			else
+				have += end > b->PlayBegin ? end - b->PlayBegin : 0;
 			if (have >= need)
 				break;
 		}
 		cb_post(v, CB_PASS_START,
 			(void *)(UINT_PTR)(have >= need ? 0 : (need - have) * v->block));
 		cb_post(v, CB_PASS_END, NULL);
+		v->pass_q = 1;
 	}
 }
 
@@ -893,31 +1032,20 @@ static void out_start(void)
  * wait is bounded because a mixer that will not stop must not be allowed to
  * hold up a save; if it ever times out the log says so rather than continuing
  * on an assumption. */
-/* Nothing queued before a rewind may be delivered after one.
- *
- * The pending ring is a static in a module we hold, so it is present tense, and
- * the XA2Callback pointers in it are the game's - which is past tense the moment
- * a restore lands. An entry queued for an object the game created after the save
- * survives the rewind pointing at memory whose first word is now whatever stood
- * there at save time, and cb_flush reads that word as a vtable. Measured: a
- * fault at cb_flush+0x92 reading F5C8BE54, zero frames after a restore, on the
- * instruction that indexes the callback's table.
- *
- * Dropping them is not a compromise. These callbacks say "the mixer wants more
- * samples" and "a buffer finished"; both are re-asked on the next pass, and the
- * world they were asked about no longer exists. */
-static void cb_drop(void)
-{
-	EnterCriticalSection(&g_cs);
-	g_pend_lost += (unsigned long)g_pend_n;
-	g_pend_head = 0;
-	g_pend_n = 0;
-	LeaveCriticalSection(&g_cs);
-}
+/* The pending ring is no longer emptied here. It used to be a static in this
+ * DLL, held in the present, so an entry queued for an object the game created
+ * after the save survived a rewind pointing at a dead object (a fault at
+ * cb_flush+0x92 reading F5C8BE54), and dropping the ring at every park was the
+ * cure. But "a buffer finished" is not re-asked: a notification dropped at a
+ * park is one the game never hears, at the save and again at every restore of
+ * it, and DxLib's stream ring falls out of step with the voice - the section
+ * that plays after a load and then plays again. The ring now lives in the
+ * arena, so a restore brings back exactly the entries that were pending at the
+ * save, each naming an object that exists in the restored heap. */
 
-/* User-mode only: drop pending callbacks and idle the mix thread. No
- * waveOutPause - that waits on wineserver under Proton, so park_audio_gpu
- * calls this and returns when ss_under_wine(). */
+/* User-mode only: idle the mix thread. No waveOutPause - that waits on
+ * wineserver under Proton, so park_audio_gpu calls this and returns when
+ * ss_under_wine(). */
 void xa2_sw_quiesce(void)
 {
 	int spins;
@@ -927,7 +1055,6 @@ void xa2_sw_quiesce(void)
 	 * ends. */
 	if (!g_ready)
 		return;
-	cb_drop();
 	if (!g_out_live)
 		return;
 	InterlockedExchange(&g_mix_park, 1);
@@ -940,18 +1067,35 @@ void xa2_sw_quiesce(void)
 		       "restore as explained\n");
 }
 
+static int g_wo_paused, g_wo_discard;
+
 void xa2_sw_park(void)
 {
 	xa2_sw_quiesce();
 	if (!g_out_live)
 		return;
 	waveOutPause(g_wo);
+	g_wo_paused = 1;
 }
 
 void xa2_sw_resume(void)
 {
 	if (!g_out_live)
 		return;
+	/* After a load, the blocks still queued in waveOut are up to 93 ms of the
+	 * moment before it, and restarting would play them ahead of the restored
+	 * audio. Reset hands them all back as done, and the mixer refills from
+	 * the restored voices. Only when we paused it ourselves: a reset waits on
+	 * wineserver just as a pause does. */
+	if (g_wo_discard && g_wo_paused) {
+		int i;
+
+		waveOutReset(g_wo);
+		for (i = 0; i < OUT_BLOCKS; i++)
+			g_out->hdr[i].dwFlags |= WHDR_DONE;
+	}
+	g_wo_discard = 0;
+	g_wo_paused = 0;
 	waveOutRestart(g_wo);
 	InterlockedExchange(&g_mix_park, 0);
 	SetEvent(g_mix_wake);
@@ -972,6 +1116,7 @@ void xa2_sw_restored(void)
 
 	if (!g_ready)
 		return;
+	g_wo_discard = 1;
 	if (g_gen_valve < 0) {
 		char v[8];
 		unsigned n = savestate_getenv("D3D9SW_XA2_GEN", v, sizeof(v));
@@ -987,6 +1132,54 @@ void xa2_sw_restored(void)
 		alive++;
 		if (v->epoch != e)
 			carried++;
+	}
+	if (savestate_last_load_foreign()) {
+		int ok = 0, changed = 0, gone = 0, said = 0, k;
+
+		EnterCriticalSection(&g_cs);
+		for (i = 0; i < g_vn; i++) {
+			SwVoice *v = g_vtab[i];
+
+			if (!v || !v->alive || v->kind != 0)
+				continue;
+			for (k = 0; k < v->n; k++) {
+				int at = (v->head + k) % XA2_MAX_QUEUED;
+				const XA2_BUFFER *b = &v->q[at];
+				MEMORY_BASIC_INFORMATION mbi;
+				int readable = b->pAudioData &&
+					       pcm_readable(b->pAudioData, b->AudioBytes);
+
+				if (readable &&
+				    pcm_sum(b->pAudioData, b->AudioBytes) == v->qsum[at]) {
+					ok++;
+					continue;
+				}
+				if (readable)
+					changed++;
+				else
+					gone++;
+				v->qsum[at] = 0;
+				if (said++ < 8) {
+					memset(&mbi, 0, sizeof(mbi));
+					VirtualQuery(b->pAudioData, &mbi, sizeof(mbi));
+					ss_log("xa2_sw:   voice %08lX buffer %d: %lu byte(s) at %08lX %s "
+					       "- allocation %08lX, type %lX\n",
+					       (unsigned long)(UINT_PTR)v, k,
+					       (unsigned long)b->AudioBytes,
+					       (unsigned long)(UINT_PTR)b->pAudioData,
+					       readable ? "hold other bytes now" : "is not readable",
+					       (unsigned long)(UINT_PTR)mbi.AllocationBase,
+					       (unsigned long)mbi.Type);
+				}
+			}
+		}
+		LeaveCriticalSection(&g_cs);
+		g_sub_audit = 512;
+		g_sub_ok = g_sub_held = g_sub_outside = g_sub_said = 0;
+		ss_log("xa2_sw: queued PCM after a load from another process - %d buffer(s) "
+		       "hold what was submitted, %d hold other bytes, %d unreadable. The last "
+		       "two play as silence\n",
+		       ok, changed, gone);
 	}
 	ss_log("xa2_sw: restore generation %ld - %d voice(s) alive, %d carried across "
 	       "this restore%s\n",
@@ -1220,6 +1413,45 @@ static HRESULT WINAPI S_Stop(SwVoice *v, UINT32 flags, UINT32 op)
 	return S_OK;
 }
 
+/* After a load from another process: where the PCM the game goes on submitting
+ * lives. A sample the game loaded once and keeps replaying from memory is only
+ * the save's sample if the load wrote that memory; left in the present, it is
+ * whatever this launch keeps at that address. */
+static void submit_audit(SwVoice *v, const XA2_BUFFER *b)
+{
+	int r = b->pAudioData ? savestate_addr_restored(b->pAudioData) : 1, k;
+	MEMORY_BASIC_INFORMATION mbi;
+
+	if (r == 1)
+		g_sub_ok++;
+	else {
+		memset(&mbi, 0, sizeof(mbi));
+		VirtualQuery(b->pAudioData, &mbi, sizeof(mbi));
+		if (r == 0)
+			g_sub_held++;
+		else
+			g_sub_outside++;
+		for (k = 0; k < g_sub_said; k++)
+			if (g_sub_seen[k] == (UINT_PTR)mbi.AllocationBase)
+				break;
+		if (k == g_sub_said && g_sub_said < 16) {
+			g_sub_seen[g_sub_said++] = (UINT_PTR)mbi.AllocationBase;
+			ss_log("xa2_sw: submit to voice %08lX reads %lu byte(s) at %08lX, in "
+			       "allocation %08lX type %lX - %s\n",
+			       (unsigned long)(UINT_PTR)v, (unsigned long)b->AudioBytes,
+			       (unsigned long)(UINT_PTR)b->pAudioData,
+			       (unsigned long)(UINT_PTR)mbi.AllocationBase, (unsigned long)mbi.Type,
+			       r == 0 ? "the save had this region and the load LEFT IT in the present"
+				      : "not in the save at all");
+		}
+	}
+	if (--g_sub_audit == 0)
+		ss_log("xa2_sw: of the first 512 submits after the load, %d read restored "
+		       "memory, %d memory the load left in the present, %d memory the save "
+		       "never held\n",
+		       g_sub_ok, g_sub_held, g_sub_outside);
+}
+
 static HRESULT WINAPI S_SubmitSourceBuffer(SwVoice *v, const XA2_BUFFER *b, const void *wmadata)
 {
 	(void)wmadata;
@@ -1228,6 +1460,8 @@ static HRESULT WINAPI S_SubmitSourceBuffer(SwVoice *v, const XA2_BUFFER *b, cons
 	   b ? b->AudioBytes : 0, b ? b->LoopCount : 0);
 	if (!b)
 		return E_INVALIDARG;
+	if (g_sub_audit > 0)
+		submit_audit(v, b);
 	EnterCriticalSection(&g_cs);
 	advance(v);
 	if (v->n >= XA2_MAX_QUEUED) {
@@ -1259,7 +1493,9 @@ static HRESULT WINAPI S_SubmitSourceBuffer(SwVoice *v, const XA2_BUFFER *b, cons
 		return E_FAIL;
 	}
 	v->q[(v->head + v->n) % XA2_MAX_QUEUED] = *b;
-	v->n++;
+	v->qsum[(v->head + v->n) % XA2_MAX_QUEUED] = pcm_sum(b->pAudioData, b->AudioBytes);
+	if (v->n++ == 0)
+		head_enter(v);
 	g_submits++;
 	LeaveCriticalSection(&g_cs);
 	cb_flush();
@@ -1271,7 +1507,7 @@ static HRESULT WINAPI S_FlushSourceBuffers(SwVoice *v)
 	g_calls[M_FLUSH]++;
 	EnterCriticalSection(&g_cs);
 	v->n = 0;
-	v->pos = 0;
+	head_enter(v);
 	v->anchor = now_qpc();
 	LeaveCriticalSection(&g_cs);
 	cb_flush();
@@ -1622,10 +1858,11 @@ void xa2_sw_report(void)
 	 * anyone having to listen for it: at 1024 frames a block, a few thousand
 	 * dry frames is an underrun and not a rounding error. */
 	ss_log("xa2_sw: %lu voice(s), %lu buffer(s) submitted, %lu block(s) mixed, "
-	       "%lu dry frame(s), %lu overflow(s), %lu callback(s) dropped at a park "
-	       "and %lu because the ring was full%s, %lu refused as no longer "
-	       "callable%s. Every callback ran on the game's own thread\n",
-	       g_voices, g_submits, g_blocks_out, g_starved, g_overflow, g_pend_lost,
+	       "%lu dry frame(s), %lu overflow(s), %d callback(s) pending and carried "
+	       "with the snapshot, %lu dropped because the ring was full%s, %lu "
+	       "refused as no longer callable%s. Every callback ran on the game's "
+	       "own thread\n",
+	       g_voices, g_submits, g_blocks_out, g_starved, g_overflow, g_pend_n,
 	       g_pend_full,
 	       g_pend_full ? " <<< the second number is audio going quiet" : "",
 	       g_cb_refused,
