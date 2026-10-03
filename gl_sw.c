@@ -3092,7 +3092,8 @@ BOOL WINAPI wglSwapBuffers(HDC hdc)
 			w = g_win_w;
 			h = g_win_h;
 		}
-		glfwd_present(hwnd && hwnd_area(hwnd) > 4 ? hwnd : c->hwnd, w, h, g_swap_interval);
+		glfwd_present(own_live_window(hwnd && hwnd_area(hwnd) > 4 ? hwnd : c->hwnd), w, h,
+			      g_swap_interval);
 		n = InterlockedIncrement(&g_present_n);
 		if (n <= 5 || (n % 300) == 1)
 			gl_log("SwapBuffers #%ld %dx%d on the GPU host", n, w, h);

@@ -746,6 +746,9 @@ static void present(HWND hwnd, int interval)
 
 	if (g_p.failed || !g_cc)
 		return;
+	/* A restore can hand over a window from the saving launch. */
+	if (hwnd != g_p.hwnd && g_p.hwnd && !IsWindow(hwnd))
+		hwnd = g_p.hwnd;
 	if (hwnd != g_p.hwnd && !pres_init(hwnd)) {
 		g_p.failed = 1;
 		pres_free();

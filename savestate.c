@@ -589,6 +589,8 @@ static void ss_where_reg(const char *name, uintptr_t v);
  * the setting reachable by a route the user controls, and then say out loud
  * what was actually read. */
 static DWORD ss_getenv(const char *name, char *buf, DWORD cap);
+static void cfg_fault_note(void);
+static int xs_spare_idx(DWORD tid);
 
 /* Declared up here because the heap partitioning has to know whether block
  * restore is on to warn about a combination that silently does nothing. */
@@ -911,7 +913,7 @@ typedef struct TimeBase {
 
 /* What a tracked handle names, so a load in another process can make the same
  * value name an equivalent object again. 0 is an event of unknown reset type. */
-enum { HK_EVENT = 0, HK_EVENT_MANUAL, HK_EVENT_AUTO, HK_THREAD };
+enum { HK_EVENT = 0, HK_EVENT_MANUAL, HK_EVENT_AUTO, HK_THREAD, HK_MUTEX };
 
 typedef struct EventState {
 	HANDLE h;
@@ -1007,6 +1009,17 @@ static HANDLE WINAPI hook_createeventw(LPSECURITY_ATTRIBUTES sa, BOOL manual, BO
 	return h;
 }
 
+/* haydee.dll's HDMutex, which game.dll uses too: a global one guards every
+ * component's reference count, so a room change waits on it, and a value from
+ * another launch names nothing that will ever be released. */
+static HANDLE WINAPI hook_createmutex(LPSECURITY_ATTRIBUTES sa, BOOL owned, LPCSTR name)
+{
+	HANDLE h = CreateMutexA(sa, owned, name);
+
+	event_note_at(h, HK_MUTEX, 0, (uintptr_t)__builtin_return_address(0));
+	return h;
+}
+
 /* The handle a game module keeps for its own thread - PhysX joins its workers
  * through it at exit, so in a restore from another process the saved value has
  * to name the live thread that took the saved one's place. */
@@ -1060,7 +1073,10 @@ static int events_capture(EventState *out, int max)
 		out[n].kind = g_events->kind[i];
 		out[n].tid = g_events->tid[i];
 		out[n].site = g_events->site[i];
-		out[n].signalled = out[n].kind == HK_THREAD ? 0 : event_probe(h);
+		/* A zero wait on a mutex would take it. */
+		out[n].signalled = out[n].kind == HK_THREAD || out[n].kind == HK_MUTEX
+					   ? 0
+					   : event_probe(h);
 		n++;
 	}
 	return n;
@@ -2389,9 +2405,7 @@ static int runaway_mode(void)
 		char v[16];
 		DWORD n = ss_getenv("D3D9SW_RUNAWAY", v, sizeof(v));
 
-		if (!n || n >= sizeof(v))
-			return 1;
-		cached = atoi(v) ? 1 : 0;
+		cached = (!n || n >= sizeof(v)) ? 1 : (atoi(v) ? 1 : 0);
 	}
 	return cached;
 }
@@ -2992,7 +3006,24 @@ static void xlog_chain(DWORD code, uintptr_t pc)
 #endif
 }
 
+/* A fault inside the handler re-enters it, and on that path the handler has
+ * looped until the stack ran out, hiding the fault that started it. */
+static _Thread_local int g_in_fault;
+static LONG ss_fault_body(EXCEPTION_POINTERS *ep);
+
 static LONG CALLBACK ss_fault_log(EXCEPTION_POINTERS *ep)
+{
+	LONG r;
+
+	if (g_in_fault)
+		return EXCEPTION_CONTINUE_SEARCH;
+	g_in_fault = 1;
+	r = ss_fault_body(ep);
+	g_in_fault = 0;
+	return r;
+}
+
+static LONG ss_fault_body(EXCEPTION_POINTERS *ep)
 {
 	DWORD code = ep->ExceptionRecord->ExceptionCode;
 	MEMORY_BASIC_INFORMATION mbi;
@@ -3014,6 +3045,7 @@ static LONG CALLBACK ss_fault_log(EXCEPTION_POINTERS *ep)
 		       "allocator's LFH chain is inconsistent. Abandoning the walk "
 		       "rather than taking the process down with it.\n",
 		       (void *)pc, mod ? mod : "?", moff);
+		g_in_fault = 0;
 		longjmp(g_hw_jmp, 1);
 	}
 
@@ -3273,6 +3305,7 @@ static LONG CALLBACK ss_fault_log(EXCEPTION_POINTERS *ep)
 		       (unsigned long)code, (void *)pc, in ? in : "unknown", off,
 		       (unsigned long)GetCurrentThreadId(), (long)g_frames_since_load);
 	}
+	cfg_fault_note();
 	focus_report();
 	gameheap_va_dump(200);
 	/* What the instruction was reaching for.
@@ -4305,6 +4338,8 @@ void *savestate_game_import_hook(const char *fn)
 				GetProcAddress(k32, "CreateEventW");
 		return g_real_createeventw ? (void *)hook_createeventw : NULL;
 	}
+	if (!lstrcmpA(fn, "CreateMutexA"))
+		return (void *)hook_createmutex;
 	if (!lstrcmpA(fn, "CreateThread")) {
 		if (!g_real_createthread && k32)
 			g_real_createthread = (HANDLE(WINAPI *)(LPSECURITY_ATTRIBUTES, SIZE_T,
@@ -4866,6 +4901,21 @@ typedef struct Control {
 	} fmt[SS_FMT_SLOTS];
 
 	Slot slots[SAVESTATE_SLOTS + 1];
+	/* Settings that differ between the loaded save and this launch, one line,
+	 * so every fault report after the load says it first. */
+	char cfg_diff[512];
+	/* The stall watchdog's thread, kept out of every save. */
+	DWORD wd_tid;
+	/* Stand-in threads of ours, started before a load freezes anything, one
+	 * per saved game thread with no live thread in its role. A load moves the
+	 * saved thread onto one; a stand-in still idle is kept out of saves and
+	 * told to exit when the load is over. 0 once taken or released. */
+	DWORD spare_tid[100];
+	volatile LONG spare_ready[100];
+	/* Stand-ins the current load took, ended if it rolls back: the scratch
+	 * save it returns to predates them. */
+	DWORD spare_taken[100];
+	int nspare_taken;
 } Control;
 
 static Control *g_ctl;
@@ -11801,9 +11851,16 @@ static void build_exclusions(void)
 			 * steamclient after all - and those three want different
 			 * fixes. Guessing between them is how the last two heap
 			 * classifiers went wrong. */
-			if (!region_excluded((uintptr_t)g_ctl->starts[i], 1))
+			/* The stall watchdog is ours and starts in our image, which
+			 * rewinds, so its start address alone counted it as a game
+			 * thread: saved, and then unmatched in the next launch. */
+			int keep_out = region_excluded((uintptr_t)g_ctl->starts[i], 1) ||
+				       (g_ctl->wd_tid && g_ctl->ids[i] == g_ctl->wd_tid) ||
+				       xs_spare_idx(g_ctl->ids[i]) >= 0;
+
+			if (!keep_out)
 				tally_owner(rnames, rcounts, &nrewound, g_ctl->starts[i]);
-			if (region_excluded((uintptr_t)g_ctl->starts[i], 1)) {
+			if (keep_out) {
 				g_ctl->transient[i] = 1;
 				ss_exclude_as("thread stack", (void *)foot, (size_t)(hi - foot));
 				tally_owner(onames, ocounts, &nown, g_ctl->starts[i]);
@@ -13558,6 +13615,210 @@ static void slotfile_write_index(int slotno, const Slot *s)
 	ss_log("  slotfile: %s written - the .bin is addressable from it\n", path);
 }
 
+/* Settings beside each save.
+ *
+ * A load from another launch runs the old launch's memory under this launch's
+ * settings, and then rewinds most of our cached knob values to the save's -
+ * the config buffer itself included. A setting changed in between (PhysX off
+ * at the save and on at the load, or a rebuilt wrapper) gives a crash that
+ * looks like the game's. So every save writes d3d9sw_slotN.cfg with each
+ * setting in effect and the wrapper's file identity, and every load compares
+ * it with the present before a byte moves. Names come from the memoised
+ * environment and the cfg file; nothing here asks the OS for the environment,
+ * because the save runs with the game frozen. */
+#define SS_CFGSNAP_MAX 8192
+
+static int cfg_text_get(const char *t, int n, const char *name, char *val, int cap)
+{
+	int i = 0, nlen = lstrlenA(name);
+
+	while (i < n) {
+		int s = i, e, k;
+
+		while (i < n && t[i] != '\n')
+			i++;
+		e = i;
+		if (i < n)
+			i++;
+		while (e > s && (t[e - 1] == '\r' || t[e - 1] == ' ' || t[e - 1] == '\t'))
+			e--;
+		while (s < e && (t[s] == ' ' || t[s] == '\t'))
+			s++;
+		if (e - s <= nlen || t[s] == '#' || t[s] == ';')
+			continue;
+		for (k = 0; k < nlen; k++)
+			if ((t[s + k] | 0x20) != (name[k] | 0x20))
+				break;
+		if (k < nlen)
+			continue;
+		k = s + nlen;
+		while (k < e && (t[k] == ' ' || t[k] == '\t'))
+			k++;
+		if (k >= e || t[k] != '=')
+			continue;
+		k++;
+		if (val) {
+			int m = e - k < cap - 1 ? e - k : cap - 1;
+
+			memcpy(val, t + k, (size_t)m);
+			val[m] = 0;
+		}
+		return 1;
+	}
+	return 0;
+}
+
+static void cfg_snap_add(char *out, int *n, const char *name)
+{
+	char v[64], line[160];
+	DWORD k;
+	int len;
+
+	if (!name[0] || cfg_text_get(out, *n, name, NULL, 0))
+		return;
+	k = ss_getenv(name, v, sizeof(v));
+	if (k >= sizeof(v))
+		k = 0;
+	v[k] = 0;
+	len = wsprintfA(line, "%s=%s\r\n", name, v);
+	if (*n + len >= SS_CFGSNAP_MAX)
+		return;
+	memcpy(out + *n, line, (size_t)len);
+	*n += len;
+}
+
+static int cfg_snapshot(char *out)
+{
+	char path[MAX_PATH], name[48];
+	WIN32_FILE_ATTRIBUTE_DATA fa;
+	MEMORY_BASIC_INFORMATION mbi;
+	int n = 0, i = 0;
+
+	if (VirtualQuery((LPCVOID)cfg_snapshot, &mbi, sizeof(mbi)) &&
+	    GetModuleFileNameA((HMODULE)mbi.AllocationBase, path, sizeof(path)) &&
+	    GetFileAttributesExA(path, GetFileExInfoStandard, &fa))
+		n = wsprintfA(out, "WRAPPER_BUILD=%lu-%08lX%08lX\r\n", fa.nFileSizeLow,
+			      fa.ftLastWriteTime.dwHighDateTime,
+			      fa.ftLastWriteTime.dwLowDateTime);
+	for (i = 0; i < g_env_memo_n; i++)
+		cfg_snap_add(out, &n, g_env_memo[i].name);
+	cfg_load();
+	i = 0;
+	while (g_cfg && i < g_cfg_len) {
+		int s, k = 0;
+
+		while (i < g_cfg_len && (g_cfg[i] == ' ' || g_cfg[i] == '\t' ||
+					 g_cfg[i] == '\r' || g_cfg[i] == '\n'))
+			i++;
+		s = i;
+		while (i < g_cfg_len && g_cfg[i] != '\n')
+			i++;
+		if (s >= i || g_cfg[s] == '#' || g_cfg[s] == ';')
+			continue;
+		while (s + k < i && k < (int)sizeof(name) - 1 && g_cfg[s + k] != '=' &&
+		       g_cfg[s + k] != ' ' && g_cfg[s + k] != '\t')
+			name[k] = g_cfg[s + k], k++;
+		name[k] = 0;
+		cfg_snap_add(out, &n, name);
+	}
+	out[n] = 0;
+	return n;
+}
+
+static void cfg_write_for_slot(int slotno)
+{
+	static char snap[SS_CFGSNAP_MAX + 1];
+	char path[MAX_PATH];
+	HANDLE f;
+	DWORD wrote = 0;
+	int n = cfg_snapshot(snap);
+
+	slotfile_path(path, sizeof(path), slotno, "cfg");
+	f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+			NULL);
+	if (f == INVALID_HANDLE_VALUE)
+		return;
+	WriteFile(f, snap, (DWORD)n, &wrote, NULL);
+	CloseHandle(f);
+}
+
+static void cfg_diff_note(const char *name, const char *was, const char *now)
+{
+	char item[160];
+	int have = lstrlenA(g_ctl->cfg_diff), len;
+
+	ss_log("  config: %s was \"%s\" at the save, \"%s\" now\n", name, was, now);
+	len = wsprintfA(item, "%s%s %s->%s", have ? ", " : "", name, was, now);
+	if (have + len < (int)sizeof(g_ctl->cfg_diff))
+		memcpy(g_ctl->cfg_diff + have, item, (size_t)len + 1);
+}
+
+/* Before the restore: afterwards our own copy of the settings is the save's. */
+static void cfg_compare_with_slot(int slotno)
+{
+	static char saved[SS_CFGSNAP_MAX + 1], now[SS_CFGSNAP_MAX + 1];
+	char path[MAX_PATH], name[48], a[64], b[64];
+	HANDLE f;
+	DWORD got = 0;
+	int ns, nn, i = 0, diffs = 0;
+
+	g_ctl->cfg_diff[0] = 0;
+	slotfile_path(path, sizeof(path), slotno, "cfg");
+	f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL, NULL);
+	if (f == INVALID_HANDLE_VALUE) {
+		ss_log("  config: no settings were recorded with this save (older build) - "
+		       "cannot tell whether they changed\n");
+		return;
+	}
+	ReadFile(f, saved, SS_CFGSNAP_MAX, &got, NULL);
+	CloseHandle(f);
+	ns = (int)got;
+	saved[ns] = 0;
+	nn = cfg_snapshot(now);
+	/* Every name on either side, saved side first. */
+	for (int pass = 0; pass < 2; pass++) {
+		const char *t = pass ? now : saved;
+		int n = pass ? nn : ns;
+
+		for (i = 0; i < n;) {
+			int s = i, k = 0;
+
+			while (i < n && t[i] != '\n')
+				i++;
+			if (i < n)
+				i++;
+			while (s + k < i && k < (int)sizeof(name) - 1 && t[s + k] != '=')
+				name[k] = t[s + k], k++;
+			name[k] = 0;
+			if (!k || (pass && cfg_text_get(saved, ns, name, NULL, 0)))
+				continue;
+			if (!cfg_text_get(saved, ns, name, a, sizeof(a)))
+				lstrcpyA(a, "(unset)");
+			if (!cfg_text_get(now, nn, name, b, sizeof(b)))
+				lstrcpyA(b, "(unset)");
+			if (lstrcmpA(a, b)) {
+				cfg_diff_note(name, a, b);
+				diffs++;
+			}
+		}
+	}
+	if (diffs)
+		ss_log("  config: %d setting(s) differ from the save. Our own cached copies "
+		       "rewind to the save's values, so the wrapper now runs a mix of "
+		       "both - suspect this before the game\n",
+		       diffs);
+	else
+		ss_log("  config: every setting matches the save, and so does the wrapper "
+		       "build\n");
+}
+
+static void cfg_fault_note(void)
+{
+	if (g_ctl && g_ctl->cfg_diff[0])
+		ss_raw("       settings differ from the loaded save: %s\n", g_ctl->cfg_diff);
+}
+
 /* Never a local copy of a Slot. SS_MAX_REGIONS is 65536 and every one of 256
  * thread slots carries a CONTEXT, so the struct runs to several megabytes and a
  * stack copy of it is an immediate C00000FD - which is exactly how the first
@@ -13587,6 +13848,7 @@ static void slotfile_write_meta(int slotno, Slot *s)
 	       "alongside\n",
 	       path, s->nregs, s->nthreads, (double)s->bytes / (1024.0 * 1024.0));
 	slotfile_write_index(slotno, s);
+	cfg_write_for_slot(slotno);
 }
 
 /* Fills an empty slot from the pair of files, so Shift+F5 in a fresh session
@@ -17703,10 +17965,153 @@ static DWORD xs_new_tid(DWORD old_tid)
 	return 0;
 }
 
-/* PhysX's task workers sit idle between steps in both launches, waiting on the
- * dispatcher's events, so the live ones are left where they are rather than
- * handed the saved stacks; their events are paired by role in xs_handles_pin.
- * D3D9SW_PHYSX_WORKERS=move transplants them like any other thread. */
+#define SS_SPARE_CAP ((int)(sizeof(g_ctl->spare_tid) / sizeof(g_ctl->spare_tid[0])))
+
+/* Exits once its slot no longer names it. A stand-in that a load takes never
+ * gets back here: its registers become the saved thread's. */
+static DWORD WINAPI xs_spare_main(LPVOID p)
+{
+	int k = (int)(uintptr_t)p;
+	DWORD me = GetCurrentThreadId();
+
+	InterlockedExchange(&g_ctl->spare_ready[k], 1);
+	while (g_ctl->spare_tid[k] == me)
+		Sleep(100);
+	return 0;
+}
+
+static int xs_spare_idx(DWORD tid)
+{
+	int k;
+
+	if (!g_ctl || !tid)
+		return -1;
+	for (k = 0; k < SS_SPARE_CAP; k++)
+		if (g_ctl->spare_tid[k] == tid)
+			return k;
+	return -1;
+}
+
+/* A saved start address inside our own image: a watchdog or spare from the
+ * saving launch, whose frames return into that launch's build of us. */
+static int xs_in_self(uintptr_t a)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	const unsigned char *b;
+	const IMAGE_NT_HEADERS *nt;
+
+	if (!VirtualQuery((LPCVOID)xs_spare_main, &mbi, sizeof(mbi)))
+		return 0;
+	b = (const unsigned char *)mbi.AllocationBase;
+	nt = (const IMAGE_NT_HEADERS *)(b + ((const IMAGE_DOS_HEADER *)b)->e_lfanew);
+	return a >= (uintptr_t)b && a < (uintptr_t)b + nt->OptionalHeader.SizeOfImage;
+}
+
+/* Before the freeze, so each new thread finishes the loader's thread attach
+ * while nothing that could hold the loader lock is suspended. Counts, role by
+ * role (entry point), the saved threads no live thread can take, and starts
+ * exactly that many. Returns 0 to refuse the load: more than the cap means a
+ * misread census, not a game. */
+static int xs_spares_topup(const Slot *s)
+{
+	static PVOID live[SS_MAX_THREADS];
+	static char taken[SS_MAX_THREADS];
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	THREADENTRY32 te;
+	DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId(), t0;
+	int nlive = 0, need = 0, idle = 0, made = 0, i, j, k;
+
+	if (snap == INVALID_HANDLE_VALUE)
+		return 1;
+	te.dwSize = sizeof(te);
+	if (Thread32First(snap, &te)) {
+		do {
+			HANDLE h;
+
+			if (te.th32OwnerProcessID != pid || te.th32ThreadID == self ||
+			    te.th32ThreadID == g_ctl->wd_tid || xs_spare_idx(te.th32ThreadID) >= 0 ||
+			    nlive >= SS_MAX_THREADS)
+				continue;
+			h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+			if (!h)
+				continue;
+			live[nlive++] = start_of(h);
+			CloseHandle(h);
+		} while (Thread32Next(snap, &te));
+	}
+	CloseHandle(snap);
+	memset(taken, 0, sizeof(taken));
+	for (i = 0; i < s->nthreads; i++) {
+		PVOID start = NULL;
+
+		for (k = 0; k < s->nids; k++)
+			if (s->ids[k] == s->threads[i].tid)
+				start = s->starts[k];
+		if (!start || xs_in_self((uintptr_t)start))
+			continue;
+		for (j = 0; j < nlive; j++)
+			if (!taken[j] && live[j] == start)
+				break;
+		if (j < nlive)
+			taken[j] = 1;
+		else
+			need++;
+	}
+	for (k = 0; k < SS_SPARE_CAP; k++)
+		if (g_ctl->spare_tid[k])
+			idle++;
+	if (need <= idle)
+		return 1;
+	if (need > SS_SPARE_CAP) {
+		ss_log("  threads: %d saved thread(s) have no live thread in their role, over "
+		       "the cap of %d stand-ins - refusing the load\n",
+		       need, SS_SPARE_CAP);
+		return 0;
+	}
+	for (k = 0; k < SS_SPARE_CAP && idle + made < need; k++) {
+		DWORD tid = 0;
+		HANDLE h;
+
+		if (g_ctl->spare_tid[k])
+			continue;
+		g_ctl->spare_ready[k] = 0;
+		h = CreateThread(NULL, 1u << 20, xs_spare_main, (LPVOID)(uintptr_t)k,
+				 CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION, &tid);
+		if (!h)
+			break;
+		g_ctl->spare_tid[k] = tid;
+		ResumeThread(h);
+		CloseHandle(h);
+		made++;
+	}
+	t0 = GetTickCount();
+	for (k = 0; k < SS_SPARE_CAP; k++)
+		while (g_ctl->spare_tid[k] && !g_ctl->spare_ready[k] && GetTickCount() - t0 < 2000)
+			Sleep(1);
+	ss_log("  threads: %d saved thread(s) have no live thread in their role - started "
+	       "%d stand-in(s), %d already idle\n",
+	       need, made, idle);
+	return 1;
+}
+
+/* After every load, whatever its outcome: stand-ins nobody took exit. */
+static void xs_spares_release(void)
+{
+	int k, n = 0;
+
+	for (k = 0; k < SS_SPARE_CAP; k++)
+		if (g_ctl->spare_tid[k]) {
+			g_ctl->spare_tid[k] = 0;
+			n++;
+		}
+	if (n)
+		ss_log("  threads: %d unused stand-in(s) told to exit\n", n);
+}
+
+/* PhysX's task workers are transplanted like any other thread. Left live they
+ * carry this launch's per-thread state into the restored scene, and the first
+ * room change tore down a list twice. D3D9SW_PHYSX_WORKERS=keep leaves the live
+ * ones where they are, with their events paired by role in xs_handles_pin. */
 static int xs_keep_live(const char *owner)
 {
 	static int keep = -1;
@@ -17715,7 +18120,7 @@ static int xs_keep_live(const char *owner)
 		char v[8];
 		DWORD n = ss_getenv("D3D9SW_PHYSX_WORKERS", v, sizeof(v));
 
-		keep = !(n > 0 && n < sizeof(v) && v[0] == 'm');
+		keep = n > 0 && n < sizeof(v) && v[0] == 'k';
 	}
 	return keep && !_strnicmp(owner, "PhysX", 5);
 }
@@ -17789,7 +18194,7 @@ static HANDLE live_twin(const Slot *s, int i)
 	int k, ord = 0, seen = 0, cnt;
 	DWORD flags;
 
-	if (e->kind == HK_THREAD || !e->site || !g_events)
+	if (e->kind == HK_THREAD || e->kind == HK_MUTEX || !e->site || !g_events)
 		return NULL;
 	for (k = 0; k < i; k++)
 		if (s->events[k].site == e->site && s->events[k].kind == e->kind)
@@ -17812,6 +18217,17 @@ static HANDLE live_twin(const Slot *s, int i)
 			return h;
 	}
 	return NULL;
+}
+
+/* A new object of the saved one's kind: the live thread standing in for a
+ * saved thread, an unowned mutex, or an event in its saved state. */
+static HANDLE xs_fresh(const EventState *e, DWORD want_tid)
+{
+	if (e->kind == HK_THREAD)
+		return OpenThread(THREAD_ALL_ACCESS, FALSE, want_tid);
+	if (e->kind == HK_MUTEX)
+		return CreateMutexA(NULL, FALSE, NULL);
+	return CreateEventA(NULL, e->kind != HK_EVENT_AUTO, e->signalled, NULL);
 }
 
 static int is_twin(const Slot *s, HANDLE v)
@@ -17888,15 +18304,16 @@ static void xs_handles_pin(const Slot *s)
 				if (j < SS_MAX_EVENTS && g_events->h[j] == v)
 					break;
 			if (thr ? GetThreadId(v) == want_tid
-				: (j >= 0 && !is_twin(s, v) &&
+				: (j >= 0 && !is_twin(s, v) && e->kind != HK_MUTEX &&
 				   event_type(v) == (e->kind == HK_EVENT_AUTO))) {
 				kept++;
 				continue;
 			}
-			if (j < 0 || is_twin(s, v)) {
-				HANDLE w = thr ? OpenThread(THREAD_ALL_ACCESS, FALSE, want_tid)
-					       : CreateEventA(NULL, e->kind != HK_EVENT_AUTO,
-							      e->signalled, NULL);
+			/* A live mutex may be owned by a thread the restore just handed
+			 * a saved stack, which will never release it: a mutex is always
+			 * a fresh one, and a held value is never closed. */
+			if (j < 0 || is_twin(s, v) || e->kind == HK_MUTEX) {
+				HANDLE w = xs_fresh(e, want_tid);
 
 				clash++;
 				if (w && g_ctl->nhx < SS_MAX_EVENTS) {
@@ -17914,8 +18331,7 @@ static void xs_handles_pin(const Slot *s)
 			/* This launch's own, and no restored memory names it now. */
 			CloseHandle(v);
 		}
-		src = thr ? OpenThread(THREAD_ALL_ACCESS, FALSE, want_tid)
-			  : CreateEventA(NULL, e->kind != HK_EVENT_AUTO, e->signalled, NULL);
+		src = xs_fresh(e, want_tid);
 		if (!src) {
 			fail++;
 			why = "the object to give it could not be made";
@@ -17935,7 +18351,8 @@ static void xs_handles_pin(const Slot *s)
 report:
 		if (said++ < 8)
 			ss_log("  handles: %s %p (saved tid %lu): not pinned - %s\n",
-			       thr ? "thread" : "event", v, (unsigned long)e->tid, why);
+			       thr ? "thread" : e->kind == HK_MUTEX ? "mutex" : "event", v,
+			       (unsigned long)e->tid, why);
 	}
 	ss_log("  handles: %d saved event/thread value(s) - %d already right here, %d made "
 	       "to name a fresh object, %d held by something else, %d failed, %d thread(s) "
@@ -18360,11 +18777,11 @@ static int xs_transplant(Slot *s)
 {
 #if defined(_M_IX86) || defined(__i386__)
 	static char used[SS_MAX_THREADS];
-	static int pair[SS_MAX_THREADS], kof[SS_MAX_THREADS];
+	static int pair[SS_MAX_THREADS], kof[SS_MAX_THREADS], pre[SS_MAX_THREADS];
 	static char sown[SS_MAX_THREADS][32], lown[SS_MAX_THREADS][32];
 	Window w;
 	int i, j, k, tls = 0, set = 0, nomatch = 0, nofit = 0, nobytes = 0, refused = 0;
-	int present = 0;
+	int present = 0, spared = 0, pass;
 	int tls_took = 0, tls_kept = 0;
 	const uintptr_t pg = 0x1000;
 
@@ -18392,10 +18809,49 @@ static int xs_transplant(Slot *s)
 		if (g_ctl->handles[j] && g_did_suspend[j] && !g_ctl->transient[j])
 			xs_owner_live(j, lown[j]);
 	}
+	/* Owner is the first module on the stack, so it says what a worker was
+	 * doing at that instant, not what it is: a pool worker mid-job at the save
+	 * and idle now names different modules. Pair same-owner first, then any
+	 * live thread with the same entry point. */
+	for (i = 0; i < s->nthreads && i < SS_MAX_THREADS; i++)
+		pre[i] = -1;
+	for (pass = 0; pass < 2; pass++)
+		for (i = 0; i < s->nthreads && i < SS_MAX_THREADS; i++) {
+			PVOID start = NULL;
+
+			if (pre[i] >= 0 || !s->threads[i].stack_base)
+				continue;
+			for (k = 0; k < s->nids; k++)
+				if (s->ids[k] == s->threads[i].tid)
+					start = s->starts[k];
+			if (!start || xs_in_self((uintptr_t)start))
+				continue;
+			if (sown[i][0]) {
+				for (k = 0; k < g_ctl->nmods; k++)
+					if (!lstrcmpiA(g_ctl->mod_name[k], sown[i]))
+						break;
+				if (k == g_ctl->nmods || !g_ctl->mod_rewound[k])
+					continue;
+			}
+			for (j = 0; j < g_ctl->nids && j < SS_MAX_THREADS; j++) {
+				DWORD ec;
+
+				if (used[j] || !g_ctl->handles[j] || !g_did_suspend[j] ||
+				    g_ctl->transient[j] || g_ctl->starts[j] != start ||
+				    (pass == 0 && lstrcmpiA(lown[j], sown[i])))
+					continue;
+				if (!GetExitCodeThread(g_ctl->handles[j], &ec) || ec != STILL_ACTIVE ||
+				    !teb_of(g_ctl->handles[j]))
+					continue;
+				pre[i] = j;
+				used[j] = 1;
+				break;
+			}
+		}
+	memset(used, 0, sizeof(used));
 	for (i = 0; i < s->nthreads; i++) {
 		ThreadState *t = &s->threads[i];
 		PVOID start = NULL;
-		int rank = 0, seen = 0;
 
 		pair[i] = -1;
 		for (k = 0; k < s->nids; k++)
@@ -18418,31 +18874,33 @@ static int xs_transplant(Slot *s)
 				continue;
 			}
 		}
-		for (k = 0; k < i; k++) {
-			int m;
-
-			if (lstrcmpiA(sown[k], sown[i]))
-				continue;
-			for (m = 0; m < s->nids; m++)
-				if (s->ids[m] == s->threads[k].tid && s->starts[m] == start)
-					rank++;
+		if (i < SS_MAX_THREADS && pre[i] >= 0) {
+			pair[i] = pre[i];
+			used[pair[i]] = 1;
 		}
-		for (j = 0; j < g_ctl->nids; j++) {
-			DWORD ec;
+		if (pair[i] < 0 && xs_in_self((uintptr_t)start)) {
+			ss_log("  transplant: saved tid %lu is one of ours (watchdog or spare), "
+			       "not moved\n",
+			       (unsigned long)t->tid);
+			present++;
+			continue;
+		}
+		for (j = 0; pair[i] < 0 && j < g_ctl->nids; j++) {
+			int sp = xs_spare_idx(g_ctl->ids[j]);
 
-			if (!g_ctl->handles[j] || !g_did_suspend[j] || g_ctl->transient[j] ||
-			    g_ctl->starts[j] != start || lstrcmpiA(lown[j], sown[i]))
-				continue;
-			if (!GetExitCodeThread(g_ctl->handles[j], &ec) || ec != STILL_ACTIVE ||
+			if (sp < 0 || used[j] || !g_ctl->handles[j] || !g_did_suspend[j] ||
 			    !teb_of(g_ctl->handles[j]))
 				continue;
-			if (seen++ == rank) {
-				if (!used[j]) {
-					pair[i] = j;
-					used[j] = 1;
-				}
-				break;
-			}
+			pair[i] = j;
+			used[j] = 1;
+			g_ctl->spare_tid[sp] = 0;
+			if (g_ctl->nspare_taken < SS_SPARE_CAP)
+				g_ctl->spare_taken[g_ctl->nspare_taken++] = g_ctl->ids[j];
+			spared++;
+			ss_log("  transplant: saved tid %lu (%s) has no live thread in its role - "
+			       "spare thread %lu takes it\n",
+			       (unsigned long)t->tid, sown[i][0] ? sown[i] : "game",
+			       (unsigned long)g_ctl->ids[j]);
 		}
 		if (pair[i] < 0) {
 			nomatch++;
@@ -18580,6 +19038,10 @@ static int xs_transplant(Slot *s)
 	       "whose stack was not in the slot, %d refused the context, %d belong to "
 	       "a module left in the present\n",
 	       set, s->nthreads, nomatch, nofit, nobytes, refused, present);
+	if (spared)
+		ss_log("  transplant: %d of those run on a spare thread started for the "
+		       "purpose\n",
+		       spared);
 	return tls;
 #else
 	(void)s;
@@ -19250,6 +19712,7 @@ static int load_with_rollback(int slotno)
 
 	g_ctl->rollback_ready = 0;
 	g_ctl->held_n = 0;
+	g_ctl->nspare_taken = 0;
 	if (rollback_mode() && transplant_mode()) {
 		if (!s->valid && slotfile_mode())
 			slotfile_read(slotno, s);
@@ -19271,6 +19734,18 @@ static int load_with_rollback(int slotno)
 	if (rc < 0) {
 		ss_log("rollback: the load failed its check before the release - putting "
 		       "back the scratch save\n");
+		for (int k = 0; k < g_ctl->nspare_taken; k++) {
+			HANDLE h = OpenThread(THREAD_TERMINATE, FALSE, g_ctl->spare_taken[k]);
+
+			if (h) {
+				TerminateThread(h, 0);
+				CloseHandle(h);
+			}
+		}
+		if (g_ctl->nspare_taken)
+			ss_log("rollback: %d stand-in(s) the failed load had taken were ended\n",
+			       g_ctl->nspare_taken);
+		g_ctl->nspare_taken = 0;
 		rc = do_load(SS_SCRATCH);
 		if (g_ctl->held_n) {
 			ss_log("rollback: the scratch load stopped before it froze the threads "
@@ -19282,14 +19757,81 @@ static int load_with_rollback(int slotno)
 			      : "the scratch load FAILED as well");
 		rc = 0;
 	}
+	xs_spares_release();
 	if (sc->valid)
 		slot_release(sc);
 	return rc;
 }
 
+/* The arenas are left in the present but the pointers to them live in our data
+ * section, which the restore rewinds. From another process those pointers name
+ * that process's memory - the save after one such load walked a stack reserve
+ * as the heap list. An arena is ours if it lies in a range this process
+ * excluded; any other value goes back to what it was before the restore, or to
+ * NULL so it is allocated again on next use. Sized arenas only go to NULL,
+ * since the size beside them was rewound too. */
+static void **const g_arena_ptrs[] = {
+	(void **)&g_blk_save,  (void **)&g_blk_now,    (void **)&g_reg_off,
+	(void **)&g_blk_own,   (void **)&g_blk_sys,    (void **)&g_blk_wrote,
+	(void **)&g_blk_depth, (void **)&g_blk_parent, (void **)&g_blk_root,
+	(void **)&g_blk_queue, (void **)&g_seen,       (void **)&g_cov,
+	(void **)&g_freed,     (void **)&g_held,       (void **)&g_der_mask,
+	(void **)&g_clob_ok,   (void **)&g_clob_off,   (void **)&g_clob_pre,
+};
+static void **const g_arena_sized[] = {
+	(void **)&g_der_pre, (void **)&g_der_at, (void **)&g_der_len, (void **)&g_der_plan,
+};
+#define SS_NARENA (sizeof(g_arena_ptrs) / sizeof(g_arena_ptrs[0]))
+
+static int arena_ours(const void *p)
+{
+	LONG i;
+
+	for (i = 0; i < g_ctl->nex; i++)
+		if ((uintptr_t)p >= g_ctl->ex_lo[i] && (uintptr_t)p < g_ctl->ex_hi[i])
+			return 1;
+	return 0;
+}
+
+static void arena_hold(void **keep)
+{
+	unsigned i;
+
+	for (i = 0; i < SS_NARENA; i++)
+		keep[i] = *g_arena_ptrs[i];
+}
+
+static void arena_put_back(void *const *keep)
+{
+	unsigned i, put = 0, sized = 0;
+
+	for (i = 0; i < SS_NARENA; i++) {
+		void *now = *g_arena_ptrs[i];
+
+		if (!now || arena_ours(now))
+			continue;
+		*g_arena_ptrs[i] = (keep[i] && arena_ours(keep[i])) ? keep[i] : NULL;
+		put++;
+	}
+	for (i = 0; i < sizeof(g_arena_sized) / sizeof(g_arena_sized[0]); i++)
+		if (*g_arena_sized[i] && !arena_ours(*g_arena_sized[i]))
+			sized++;
+	if (sized) {
+		for (i = 0; i < sizeof(g_arena_sized) / sizeof(g_arena_sized[0]); i++)
+			*g_arena_sized[i] = NULL;
+		g_der_cap = 0;
+		g_der_regs = 0;
+	}
+	if (put || sized)
+		ss_log("  arenas: %u pointer(s) to our scratch memory came back naming "
+		       "another process's - put back or cleared\n",
+		       put + sized);
+}
+
 static int do_load(int slotno)
 {
 	Slot *s = &g_ctl->slots[slotno];
+	void *arena_keep[SS_NARENA];
 	Window w;
 	unsigned long long pos = 0;
 	int i, j, restored = 0, skipped = 0, tls_done = 0, blocked = 0;
@@ -19314,6 +19856,8 @@ static int do_load(int slotno)
 	ss_log("  provenance: saved by pid %lu, loading in pid %lu - %s\n",
 	       (unsigned long)s->save_pid, (unsigned long)GetCurrentProcessId(),
 	       prov_name(g_ctl->load_prov));
+	if (slotfile_mode())
+		cfg_compare_with_slot(slotno);
 	/* Sampled here, before a single byte moves, because this is the only moment
 	 * that answers the question. A heap created after the snapshot exists right
 	 * now and will not exist in a moment; if the record of it is not taken on
@@ -19340,8 +19884,11 @@ static int do_load(int slotno)
 	/* Before anything moves, so a refusal costs nothing at all. */
 	if (!g_ctl->held_n && !room_check())
 		return 0;
+	if (!g_ctl->held_n && xs_foreign_load() && transplant_mode() && !xs_spares_topup(s))
+		return 0;
 	roster_save();
 	poke_init();
+	arena_hold(arena_keep);
 	g_clob_slot = -1;
 	if (clobber_mode() && clobber_marks())
 		memset(g_clob_ok, 0, SS_MAX_REGIONS);
@@ -20848,7 +21395,7 @@ static int do_load(int slotno)
 			int now;
 			HANDLE h = savestate_hx(s->events[i].h);
 			if (!s->events[i].h || s->events[i].kind == HK_THREAD ||
-			    !GetHandleInformation(h, &flags))
+			    s->events[i].kind == HK_MUTEX || !GetHandleInformation(h, &flags))
 				continue;
 			now = event_probe(h);
 			if (now == s->events[i].signalled)
@@ -20892,6 +21439,7 @@ static int do_load(int slotno)
 	 * restore prints "save". The helper is excluded from the snapshot and is
 	 * the only thread that survives the restore in its own present. */
 	roster_load();
+	arena_put_back(arena_keep);
 	{
 		DWORD t0 = GetTickCount();
 
@@ -21002,10 +21550,21 @@ static int do_load(int slotno)
 	xa2_sw_resume();
 	ss_log("  resume: done, all threads runnable\n");
 	if (xs_foreign_load()) {
-		HANDLE wd = CreateThread(NULL, 0, xs_watchdog, NULL, 0, NULL);
+		HANDLE wd = g_ctl->wd_tid ? OpenThread(SYNCHRONIZE, FALSE, g_ctl->wd_tid) : NULL;
 
-		if (wd)
+		/* One at a time: it reads the frame count, which every load resets. */
+		if (wd && WaitForSingleObject(wd, 0) == WAIT_TIMEOUT) {
 			CloseHandle(wd);
+		} else {
+			DWORD tid = 0;
+
+			if (wd)
+				CloseHandle(wd);
+			wd = CreateThread(NULL, 0, xs_watchdog, NULL, 0, &tid);
+			g_ctl->wd_tid = wd ? tid : 0;
+			if (wd)
+				CloseHandle(wd);
+		}
 	}
 	/* After the threads are running again, because the comparison is a read of
 	 * a few hundred megabytes and holding every thread suspended through it

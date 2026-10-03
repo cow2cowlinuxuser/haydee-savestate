@@ -5342,6 +5342,11 @@ static BOOL WINAPI gh_closehandle(HANDLE h)
 	return savestate_hx_close(h) ? TRUE : CloseHandle(h);
 }
 
+static BOOL WINAPI gh_releasemutex(HANDLE h)
+{
+	return ReleaseMutex(savestate_hx(h));
+}
+
 static DWORD WINAPI gh_resumethread(HANDLE h)
 {
 	return ResumeThread(savestate_hx(h));
@@ -5370,6 +5375,7 @@ static void gh_handle_hook(HMODULE mod)
 		{ "SetEvent", (void *)gh_setevent },
 		{ "ResetEvent", (void *)gh_resetevent },
 		{ "CloseHandle", (void *)gh_closehandle },
+		{ "ReleaseMutex", (void *)gh_releasemutex },
 		{ "ResumeThread", (void *)gh_resumethread },
 		{ "SetThreadPriority", (void *)gh_setthreadpriority },
 		{ "SetThreadAffinityMask", (void *)gh_setthreadaffinity },
@@ -5380,6 +5386,41 @@ static void gh_handle_hook(HMODULE mod)
 		return;
 	for (k = 0; k < sizeof(fns) / sizeof(fns[0]); k++)
 		gh_iat_swap(mod, NULL, fns[k].name, fns[k].to, NULL);
+}
+
+/* steam_api keeps each module's interface table in that module's data and
+ * refills it only when the table's counter differs from its own call counter.
+ * A load from another launch brings back the old table with a counter that can
+ * equal the new launch's, so the next achievement calls into a steamclient
+ * object from the dead process. Zeroing the counter makes every call refill;
+ * 0 is what a never-filled table holds, so before SteamAPI_Init nothing changes. */
+typedef struct {
+	void (*init)(void *);
+	uintptr_t counter;
+} GhSteamCtx;
+
+/* Looked up per call: our own data is rewound too, so a cached pointer could be
+ * the old launch's steam_api. */
+static void *__cdecl gh_steam_ctx(void *p)
+{
+	HMODULE sa = GetModuleHandleA("steam_api.dll");
+	void *(__cdecl *real)(void *) =
+		sa ? (void *(__cdecl *)(void *))(void *)GetProcAddress(sa, "SteamInternal_ContextInit")
+		   : NULL;
+
+	if (!real)
+		return p ? (char *)p + sizeof(GhSteamCtx) : NULL;
+	if (p)
+		((GhSteamCtx *)p)->counter = 0;
+	return real(p);
+}
+
+static void gh_steam_hook(HMODULE mod)
+{
+	if (mod == g_self || !gh_knob("D3D9SW_STEAM_CTX", 1))
+		return;
+	gh_iat_swap(mod, "steam_api.dll", "SteamInternal_ContextInit", (void *)gh_steam_ctx,
+		    NULL);
 }
 
 static void gh_patch_module(HMODULE mod, const WCHAR *path)
@@ -5395,6 +5436,7 @@ static void gh_patch_module(HMODULE mod, const WCHAR *path)
 	gh_window_hook(mod, path);
 	gh_di_hook(mod, path);
 	gh_handle_hook(mod);
+	gh_steam_hook(mod);
 	if (g_vaj && mod != g_self) {
 		gh_iat_swap(mod, NULL, "VirtualAlloc", (void *)gh_va_j, NULL);
 		gh_iat_swap(mod, NULL, "VirtualFree", (void *)gh_vf_j, NULL);
@@ -5403,7 +5445,7 @@ static void gh_patch_module(HMODULE mod, const WCHAR *path)
 		static const char *const rewound[] = { "QueryPerformanceCounter",
 						       "GetTickCount", "timeGetTime",
 						       "CreateEventA", "CreateEventW",
-						       "CreateThread" };
+						       "CreateMutexA", "CreateThread" };
 		unsigned k;
 
 		for (k = 0; k < sizeof(rewound) / sizeof(rewound[0]); k++) {
